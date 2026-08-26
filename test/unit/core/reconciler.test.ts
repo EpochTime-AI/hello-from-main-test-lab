@@ -978,6 +978,67 @@ describe("production reconciler boundary", () => {
     expect(result).toEqual({ kind: "terminal", reason: "policyRejected" });
   });
 
+  test("plans candidate/H2 work after a merged Contribution when main has drifted", async () => {
+    const facts = stabilityFacts();
+    const main = facts.main.value;
+    if (!main) throw new Error("main is required");
+    facts.main.value = { ...main, oid: oid("main-2") };
+    facts.integrationPullRequest = {
+      ...facts.integrationPullRequest,
+      ...(facts.integrationPullRequest.value
+        ? {
+            value: {
+              ...facts.integrationPullRequest.value,
+              baseOid: oid("main-1"),
+            },
+          }
+        : {}),
+    };
+    const writes: import("../../../src/core/model.js").CandidateWrite[] = [];
+    let retargets = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        updatePullRequestBase: async () => {
+          retargets += 1;
+          return {
+            kind: "succeeded" as const,
+            value: facts.sourcePullRequest.value,
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: {
+        readWorkspace: async () => ({
+          status: "ready" as const,
+          value: {
+            status: "ready" as const,
+            integrationHeadOid: oid("integration-1"),
+            retainedCommitOids: [oid("integration-1")],
+            requiredParentOids: [oid("integration-1")],
+          },
+        }),
+        writeIntegrationCandidate: async (
+          candidate: import("../../../src/core/model.js").CandidateWrite,
+        ) => {
+          writes.push(candidate);
+          return { kind: "retryableTransport" as const };
+        },
+      } as unknown as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(result).toEqual({ kind: "retryable", reason: "retryableTransport" });
+    expect(retargets).toBe(0);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.input.observedMainOid).toBe(oid("main-2"));
+    expect(writes[0]?.input.expectedIntegrationHeadOid).toBe(
+      oid("integration-1"),
+    );
+  });
+
   test("requires confirmation login and reviewed commit to bind the current candidate", async () => {
     const facts = stabilityFacts();
     const integration = facts.integrationPullRequest.value;

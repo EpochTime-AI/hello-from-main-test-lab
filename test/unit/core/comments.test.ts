@@ -668,6 +668,8 @@ describe("Core comment contracts", () => {
         requiredParentOids: [],
       },
     };
+    const durableCandidate = facts.candidate.value;
+    if (!durableCandidate) throw new Error("candidate is required");
     facts.confirmations = [
       {
         kind: "domainConfirmation",
@@ -786,6 +788,7 @@ describe("Core comment contracts", () => {
         value: {
           status: "ready",
           integrationHeadOid: integration.headOid,
+          candidate: durableCandidate,
           retainedCommitOids: [integration.headOid],
           requiredParentOids: [],
         },

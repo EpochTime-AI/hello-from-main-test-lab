@@ -1032,10 +1032,12 @@ function createOctokitGithubPlatform(options) {
       const branch = discoveredBranch;
       const integrationRef = branch?.name;
       const source = sourceCandidate && (!integrationRef || stringValue(asRecord2(sourceCandidate.base).ref) === integrationRef || stringValue(asRecord2(sourceCandidate.base).ref) === "main") ? sourceCandidate : void 0;
-      const sourceFact = source ? await readSourceIntake(
-        source,
-        pullRequestFact(source, "contribution")
+      const sourceRead = source ? await readExactPullRequest(
+        numberValue(source.number),
+        "contribution",
+        source
       ) : void 0;
+      const sourceFact = sourceRead ? await readSourceIntake(sourceRead.record, sourceRead.fact) : void 0;
       const sourceHeadBasedOnIntegration = sourceFact ? branch && !sourceFact.merged ? await observeSourceAncestry(branch.headOid, sourceFact.headOid) : sourceFact.merged ? {
         status: "ready",
         provenance: "provider",
@@ -1047,7 +1049,12 @@ function createOctokitGithubPlatform(options) {
           provenance: "provider"
         }
       } : { status: "pending", provenance: "provider" } : void 0;
-      const integrationFact = integration ? await hydrateMergeParents(pullRequestFact(integration, "integration")) : void 0;
+      const integrationRead = integration ? await readExactPullRequest(
+        numberValue(integration.number),
+        "integration",
+        integration
+      ) : void 0;
+      const integrationFact = integrationRead?.fact;
       const mainProjection = await readMainProjection(oid(mainOid));
       const facts = {
         main: {
@@ -1063,11 +1070,7 @@ function createOctokitGithubPlatform(options) {
         eligibility: {
           checks: integrationFact ? await observeEligibility(() => readChecks(integrationFact)) : { status: "pending", provenance: "provider" },
           reviews: integrationFact ? await observeEligibility(() => readReviews(integrationFact)) : { status: "pending", provenance: "provider" },
-          mergeability: integrationFact ? {
-            status: "ready",
-            provenance: "provider",
-            value: asRecord2(integration).mergeable === true ? "mergeable" : null
-          } : { status: "pending", provenance: "provider" },
+          mergeability: integrationRead ? mergeabilityObservation(integrationRead.record) : { status: "pending", provenance: "provider" },
           baseCurrent: integrationFact ? {
             status: "ready",
             provenance: "provider",
@@ -1472,6 +1475,33 @@ function createOctokitGithubPlatform(options) {
     );
     return pullRequestFact(response.data, "integration");
   }
+  async function readExactPullRequest(number, kind, summary) {
+    const response = await requestRest(
+      { method: "GET", path: path(`/pulls/${number}`) },
+      "read"
+    );
+    const record = asRecord2(response.data);
+    if (numberValue(record.number) !== number)
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "pull request detail returned a mismatched number"
+      );
+    if (summary && !samePullRequestIdentity(summary, record))
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "pull request detail does not match discovery summary"
+      );
+    if (kind === "integration" && (stringValue(asRecord2(record.base).ref) !== "main" || stringValue(asRecord2(record.head).ref) !== stringValue(asRecord2(summary?.head).ref)))
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "exact integration pull request does not target the expected branch and main"
+      );
+    const fact = pullRequestFact(record, kind, true);
+    return {
+      fact: fact.merged === true ? await hydrateMergeParents(fact) : fact,
+      record
+    };
+  }
   async function observeSourceAncestry(integrationHeadOid, sourceHeadOid) {
     try {
       const comparePath = path(
@@ -1677,7 +1707,13 @@ function createOctokitGithubPlatform(options) {
       { method: "GET", path: path(`/git/commits/${fact.mergeCommitOid}`) },
       "read"
     );
-    const parents = asRecord2(response.data).parents;
+    const commit = asRecord2(response.data);
+    if (stringValue(commit.sha) !== fact.mergeCommitOid)
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "merge commit response does not match pull request merge SHA"
+      );
+    const parents = commit.parents;
     if (!Array.isArray(parents))
       throw new OctokitOperationError(
         "retryableTransport",
@@ -1686,6 +1722,11 @@ function createOctokitGithubPlatform(options) {
     const mergeParentOids = parents.map(
       (parent) => oid(stringValue(asRecord2(parent).sha))
     );
+    if (mergeParentOids.length !== 2 || mergeParentOids[0] !== fact.baseOid || mergeParentOids[1] !== fact.headOid)
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "merge parents do not match pull request base and head"
+      );
     return { ...fact, mergeParentOids };
   }
   async function paginateChangedFiles(number) {
@@ -2267,8 +2308,9 @@ function compareLinkPath(pathname, origin, comparePath, repositoryId) {
   )?.[1];
   return suffix !== void 0 && pathname === `${apiPath}/repositories/${repositoryId}${suffix}`;
 }
-function pullRequestFact(value, kind) {
+function pullRequestFact(value, kind, exact = false) {
   const record = asRecord2(value);
+  if (exact) validateExactPullRequestLifecycle(record);
   return {
     number: numberValue(record.number),
     ...typeof record.node_id === "string" ? { nodeId: record.node_id } : {},
@@ -2278,7 +2320,7 @@ function pullRequestFact(value, kind) {
     ...typeof asRecord2(record.head).ref === "string" ? { headRef: stringValue(asRecord2(record.head).ref) } : {},
     ...typeof asRecord2(record.base).ref === "string" ? { baseRef: stringValue(asRecord2(record.base).ref) } : {},
     draft: record.draft === true,
-    ...record.merged === true ? { merged: true } : {},
+    ...record.merged === true || record.merged === false ? { merged: record.merged } : {},
     ...record.state === "closed" ? { closed: true } : {},
     ...typeof record.merge_commit_sha === "string" && record.merge_commit_sha.length > 0 ? { mergeCommitOid: oid(record.merge_commit_sha) } : {},
     ...Array.isArray(record.merge_commit_parents) ? {
@@ -2290,6 +2332,69 @@ function pullRequestFact(value, kind) {
     } : {},
     observedOid: oid(stringValue(asRecord2(record.head).sha)),
     provenance: "provider"
+  };
+}
+function samePullRequestIdentity(summary, exact) {
+  return numberValue(summary.number) === numberValue(exact.number) && stringValue(asRecord2(summary.head).sha) === stringValue(asRecord2(exact.head).sha) && stringValue(asRecord2(summary.head).ref) === stringValue(asRecord2(exact.head).ref) && stringValue(asRecord2(summary.base).sha) === stringValue(asRecord2(exact.base).sha) && stringValue(asRecord2(summary.base).ref) === stringValue(asRecord2(exact.base).ref);
+}
+function validateExactPullRequestLifecycle(record) {
+  if (record.state !== "open" && record.state !== "closed")
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed pull request state"
+    );
+  if (typeof record.merged !== "boolean")
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "exact pull request merged state is required"
+    );
+  const mergedAt = record.merged_at;
+  const mergeCommitSha = record.merge_commit_sha;
+  if (record.state === "open" && (record.merged || !absentOrNull(mergedAt) || !absentOrNull(mergeCommitSha)))
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed open pull request lifecycle"
+    );
+  if (record.state !== "closed") return;
+  if (!(typeof mergedAt === "string" || mergedAt === null) || !(typeof mergeCommitSha === "string" || mergeCommitSha === null) || record.merged && (typeof mergedAt !== "string" || !validTimestamp(mergedAt) || typeof mergeCommitSha !== "string" || mergeCommitSha.length === 0) || !record.merged && (mergedAt !== null || mergeCommitSha !== null))
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed closed pull request lifecycle"
+    );
+}
+function absentOrNull(value) {
+  return value === void 0 || value === null;
+}
+function validTimestamp(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(
+    value
+  );
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second] = match;
+  if (year === void 0 || month === void 0 || day === void 0 || hour === void 0 || minute === void 0 || second === void 0)
+    return false;
+  const yearNumber = Number(year);
+  const monthNumber = Number(month);
+  const dayNumber = Number(day);
+  const hourNumber = Number(hour);
+  const minuteNumber = Number(minute);
+  const secondNumber = Number(second);
+  const daysInMonth = new Date(
+    Date.UTC(yearNumber, monthNumber, 0)
+  ).getUTCDate();
+  return monthNumber >= 1 && monthNumber <= 12 && dayNumber >= 1 && dayNumber <= daysInMonth && hourNumber >= 0 && hourNumber <= 23 && minuteNumber >= 0 && minuteNumber <= 59 && secondNumber >= 0 && secondNumber <= 59 && !Number.isNaN(Date.parse(value));
+}
+function mergeabilityObservation(record) {
+  if (record.mergeable === true || record.mergeable === false)
+    return {
+      status: "ready",
+      provenance: "provider",
+      value: record.mergeable ? "mergeable" : null
+    };
+  return {
+    status: "incomplete",
+    provenance: "provider",
+    error: "exact integration pull request mergeability is incomplete"
   };
 }
 function reviewState(value) {
@@ -3095,7 +3200,7 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
   if (!integration && facts.integrationPullRequest.status === "absent")
     return { kind: "createIntegrationPr", branchName };
   if (!branchHeadOid || !integration) return void 0;
-  if (source.baseOid !== branchHeadOid) {
+  if (!source.merged && source.baseOid !== branchHeadOid) {
     return { kind: "retarget", pullRequestNumber: source.number, branchName };
   }
   if (facts.sourceHeadBasedOnIntegration?.status !== "ready" || !facts.sourceHeadBasedOnIntegration.value)
@@ -3158,12 +3263,13 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
   if (!workspace.retainedCommitOids || !workspace.requiredParentOids)
     return awaitingIncomplete();
   const candidate = facts.candidate.value;
+  const durableCandidate = workspace.candidate;
   const confirmation = facts.confirmations.find(
     (item) => item.contributorLogin === source.authorLogin && item.integrationPrNumber === integration?.number && item.reviewedCommitOid === integration?.headOid && item.cardBlobOid === candidate?.cardBlobOid && item.cardPath === candidate?.cardPath && item.sourcePrNumber === source.number && item.githubId === facts.acceptedCard?.githubId && facts.eligibility.reviews.status === "ready" && (facts.eligibility.reviews.value?.length ?? 0) > 0 && facts.eligibility.reviews.value?.some(
       (review) => review.pullRequestNumber === integration.number && review.prHeadOid === integration.headOid && review.reviewerLogin === source.authorLogin && review.state === "approved" && review.reviewedCommitOid === integration.headOid
     )
   );
-  if (facts.acceptedCard && (workspace.integrationHeadOid || branchHeadOid) && (!candidate || candidate.mainOid !== main.oid || candidate.integrationHeadOid !== integration.headOid || candidate.cardBlobOid !== gitBlobOid(facts.acceptedCard.bytes))) {
+  if (facts.acceptedCard && (workspace.integrationHeadOid || branchHeadOid) && (!durableCandidate || durableCandidate.mainOid !== main.oid || durableCandidate.integrationHeadOid !== integration.headOid || durableCandidate.cardBlobOid !== gitBlobOid(facts.acceptedCard.bytes))) {
     const card = facts.acceptedCard;
     if (!workspace.retainedCommitOids || !workspace.requiredParentOids)
       return awaitingIncomplete();
@@ -3228,26 +3334,26 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
             retainCommitOids: [
               .../* @__PURE__ */ new Set([
                 ...workspace.retainedCommitOids,
-                ...candidate?.retainedCommitOids ?? [],
+                ...durableCandidate?.retainedCommitOids ?? [],
                 oid(workspace.integrationHeadOid ?? branchHeadOid)
               ])
             ],
-            requiredParentOids: candidate && candidate.mainOid !== main.oid ? [] : [oid(workspace.integrationHeadOid ?? branchHeadOid)]
+            requiredParentOids: durableCandidate && durableCandidate.mainOid !== main.oid ? [] : [oid(workspace.integrationHeadOid ?? branchHeadOid)]
           }
         }
       }
     };
   }
-  if (candidate && integration?.draft && candidate.integrationHeadOid === integration.headOid) {
-    if (!candidate.retainedCommitOids || !candidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids)
+  if (durableCandidate && integration?.draft && durableCandidate.integrationHeadOid === integration.headOid) {
+    if (!durableCandidate.retainedCommitOids || !durableCandidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids)
       return awaitingIncomplete();
     return {
       kind: "ready",
       pullRequestNumber: integration.number,
-      candidateHeadOid: candidate.integrationHeadOid
+      candidateHeadOid: durableCandidate.integrationHeadOid
     };
   }
-  if (candidate && !integration?.draft && candidate.integrationHeadOid === integration.headOid) {
+  if (durableCandidate && !integration?.draft && durableCandidate.integrationHeadOid === integration.headOid) {
     const readyComment = commentsSupported ? commentEffect(
       facts,
       integration.number,
@@ -3257,15 +3363,15 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
         runIdentity: runIdentity(source),
         originalContributor: source.authorLogin ?? "",
         integrationPullRequestNumber: integration.number,
-        candidateHeadOid: candidate.integrationHeadOid,
-        cardPath: candidate.cardPath,
-        cardBlobOid: candidate.cardBlobOid
+        candidateHeadOid: durableCandidate.integrationHeadOid,
+        cardPath: durableCandidate.cardPath,
+        cardBlobOid: durableCandidate.cardBlobOid
       })
     ) : void 0;
     if (readyComment) return readyComment;
   }
-  if (confirmation && integration && candidate && candidate.integrationHeadOid === integration.headOid && providerEligible(facts, integration.number, integration.headOid)) {
-    if (!candidate.retainedCommitOids || !candidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids || !main.readmeBytes || !source.mergeCommitOid || !facts.protocolAnchors?.contribution)
+  if (confirmation && integration && durableCandidate && durableCandidate.integrationHeadOid === integration.headOid && providerEligible(facts, integration.number, integration.headOid)) {
+    if (!durableCandidate.retainedCommitOids || !durableCandidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids || !main.readmeBytes || !source.mergeCommitOid || !facts.protocolAnchors?.contribution)
       return awaitingIncomplete();
     const request = {
       kind: "integration",
@@ -3281,21 +3387,24 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
       expectedFinalMain: {
         mainOid: integration.headOid,
         cardManifest: {
-          path: candidate.cardPath,
-          blobOid: candidate.cardBlobOid,
+          path: durableCandidate.cardPath,
+          blobOid: durableCandidate.cardBlobOid,
           githubId: confirmation.githubId,
           sourcePrNumber: confirmation.sourcePrNumber
         },
-        readmeBytes: candidate.readmeBytes ?? main.readmeBytes,
-        retainedCommitOids: candidate.retainedCommitOids,
-        requiredParentOids: [main.oid, candidate.integrationHeadOid],
+        readmeBytes: durableCandidate.readmeBytes ?? main.readmeBytes,
+        retainedCommitOids: durableCandidate.retainedCommitOids,
+        requiredParentOids: [main.oid, durableCandidate.integrationHeadOid],
         sourceMergeCommitOid: source.mergeCommitOid,
         integrationMergeCommitOid: integration.headOid,
         contributionMergeParentOids: [
           facts.protocolAnchors.contribution.projectShellOid,
           facts.protocolAnchors.contribution.rebasedContributorOid
         ],
-        integrationMergeParentOids: [main.oid, candidate.integrationHeadOid]
+        integrationMergeParentOids: [
+          main.oid,
+          durableCandidate.integrationHeadOid
+        ]
       }
     };
   }

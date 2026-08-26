@@ -216,11 +216,15 @@ export function createOctokitGithubPlatform(
           stringValue(asRecord(sourceCandidate.base).ref) === "main")
           ? sourceCandidate
           : undefined;
-      const sourceFact = source
-        ? await readSourceIntake(
+      const sourceRead = source
+        ? await readExactPullRequest(
+            numberValue(source.number),
+            "contribution",
             source,
-            pullRequestFact(source, "contribution"),
           )
+        : undefined;
+      const sourceFact = sourceRead
+        ? await readSourceIntake(sourceRead.record, sourceRead.fact)
         : undefined;
       const sourceHeadBasedOnIntegration = sourceFact
         ? branch && !sourceFact.merged
@@ -239,9 +243,14 @@ export function createOctokitGithubPlatform(
               }
             : { status: "pending" as const, provenance: "provider" as const }
         : undefined;
-      const integrationFact = integration
-        ? await hydrateMergeParents(pullRequestFact(integration, "integration"))
+      const integrationRead = integration
+        ? await readExactPullRequest(
+            numberValue(integration.number),
+            "integration",
+            integration,
+          )
         : undefined;
+      const integrationFact = integrationRead?.fact;
       const mainProjection = await readMainProjection(oid(mainOid));
       const facts: RepositoryFacts = {
         main: {
@@ -272,13 +281,8 @@ export function createOctokitGithubPlatform(
           reviews: integrationFact
             ? await observeEligibility(() => readReviews(integrationFact))
             : { status: "pending", provenance: "provider" },
-          mergeability: integrationFact
-            ? {
-                status: "ready",
-                provenance: "provider",
-                value:
-                  asRecord(integration).mergeable === true ? "mergeable" : null,
-              }
+          mergeability: integrationRead
+            ? mergeabilityObservation(integrationRead.record)
             : { status: "pending", provenance: "provider" },
           baseCurrent: integrationFact
             ? {
@@ -795,6 +799,43 @@ export function createOctokitGithubPlatform(
     return pullRequestFact(response.data, "integration");
   }
 
+  async function readExactPullRequest(
+    number: number,
+    kind: "contribution" | "integration",
+    summary?: Record<string, unknown>,
+  ): Promise<{ fact: PullRequestFact; record: Record<string, unknown> }> {
+    const response = await requestRest(
+      { method: "GET", path: path(`/pulls/${number}`) },
+      "read",
+    );
+    const record = asRecord(response.data);
+    if (numberValue(record.number) !== number)
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "pull request detail returned a mismatched number",
+      );
+    if (summary && !samePullRequestIdentity(summary, record))
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "pull request detail does not match discovery summary",
+      );
+    if (
+      kind === "integration" &&
+      (stringValue(asRecord(record.base).ref) !== "main" ||
+        stringValue(asRecord(record.head).ref) !==
+          stringValue(asRecord(summary?.head).ref))
+    )
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "exact integration pull request does not target the expected branch and main",
+      );
+    const fact = pullRequestFact(record, kind, true);
+    return {
+      fact: fact.merged === true ? await hydrateMergeParents(fact) : fact,
+      record,
+    };
+  }
+
   async function observeSourceAncestry(
     integrationHeadOid: ReturnType<typeof oid>,
     sourceHeadOid: ReturnType<typeof oid>,
@@ -1066,7 +1107,13 @@ export function createOctokitGithubPlatform(
       { method: "GET", path: path(`/git/commits/${fact.mergeCommitOid}`) },
       "read",
     );
-    const parents = asRecord(response.data).parents;
+    const commit = asRecord(response.data);
+    if (stringValue(commit.sha) !== fact.mergeCommitOid)
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "merge commit response does not match pull request merge SHA",
+      );
+    const parents = commit.parents;
     if (!Array.isArray(parents))
       throw new OctokitOperationError(
         "retryableTransport",
@@ -1075,6 +1122,15 @@ export function createOctokitGithubPlatform(
     const mergeParentOids = parents.map((parent) =>
       oid(stringValue(asRecord(parent).sha)),
     );
+    if (
+      mergeParentOids.length !== 2 ||
+      mergeParentOids[0] !== fact.baseOid ||
+      mergeParentOids[1] !== fact.headOid
+    )
+      throw new OctokitOperationError(
+        "retryableTransport",
+        "merge parents do not match pull request base and head",
+      );
     return { ...fact, mergeParentOids };
   }
 
@@ -1832,8 +1888,10 @@ function compareLinkPath(
 function pullRequestFact(
   value: unknown,
   kind: "contribution" | "integration",
+  exact = false,
 ): PullRequestFact {
   const record = asRecord(value);
+  if (exact) validateExactPullRequestLifecycle(record);
   return {
     number: numberValue(record.number),
     ...(typeof record.node_id === "string" ? { nodeId: record.node_id } : {}),
@@ -1847,7 +1905,9 @@ function pullRequestFact(
       ? { baseRef: stringValue(asRecord(record.base).ref) }
       : {}),
     draft: record.draft === true,
-    ...(record.merged === true ? { merged: true } : {}),
+    ...(record.merged === true || record.merged === false
+      ? { merged: record.merged }
+      : {}),
     ...(record.state === "closed" ? { closed: true } : {}),
     ...(typeof record.merge_commit_sha === "string" &&
     record.merge_commit_sha.length > 0
@@ -1870,6 +1930,123 @@ function pullRequestFact(
       : {}),
     observedOid: oid(stringValue(asRecord(record.head).sha)),
     provenance: "provider",
+  };
+}
+
+function samePullRequestIdentity(
+  summary: Record<string, unknown>,
+  exact: Record<string, unknown>,
+): boolean {
+  return (
+    numberValue(summary.number) === numberValue(exact.number) &&
+    stringValue(asRecord(summary.head).sha) ===
+      stringValue(asRecord(exact.head).sha) &&
+    stringValue(asRecord(summary.head).ref) ===
+      stringValue(asRecord(exact.head).ref) &&
+    stringValue(asRecord(summary.base).sha) ===
+      stringValue(asRecord(exact.base).sha) &&
+    stringValue(asRecord(summary.base).ref) ===
+      stringValue(asRecord(exact.base).ref)
+  );
+}
+
+function validateExactPullRequestLifecycle(
+  record: Record<string, unknown>,
+): void {
+  if (record.state !== "open" && record.state !== "closed")
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed pull request state",
+    );
+  if (typeof record.merged !== "boolean")
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "exact pull request merged state is required",
+    );
+  const mergedAt = record.merged_at;
+  const mergeCommitSha = record.merge_commit_sha;
+  if (
+    record.state === "open" &&
+    (record.merged || !absentOrNull(mergedAt) || !absentOrNull(mergeCommitSha))
+  )
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed open pull request lifecycle",
+    );
+  if (record.state !== "closed") return;
+  if (
+    !(typeof mergedAt === "string" || mergedAt === null) ||
+    !(typeof mergeCommitSha === "string" || mergeCommitSha === null) ||
+    (record.merged &&
+      (typeof mergedAt !== "string" ||
+        !validTimestamp(mergedAt) ||
+        typeof mergeCommitSha !== "string" ||
+        mergeCommitSha.length === 0)) ||
+    (!record.merged && (mergedAt !== null || mergeCommitSha !== null))
+  )
+    throw new OctokitOperationError(
+      "retryableTransport",
+      "malformed closed pull request lifecycle",
+    );
+}
+
+function absentOrNull(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+function validTimestamp(value: string): boolean {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(
+      value,
+    );
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second] = match;
+  if (
+    year === undefined ||
+    month === undefined ||
+    day === undefined ||
+    hour === undefined ||
+    minute === undefined ||
+    second === undefined
+  )
+    return false;
+  const yearNumber = Number(year);
+  const monthNumber = Number(month);
+  const dayNumber = Number(day);
+  const hourNumber = Number(hour);
+  const minuteNumber = Number(minute);
+  const secondNumber = Number(second);
+  const daysInMonth = new Date(
+    Date.UTC(yearNumber, monthNumber, 0),
+  ).getUTCDate();
+  return (
+    monthNumber >= 1 &&
+    monthNumber <= 12 &&
+    dayNumber >= 1 &&
+    dayNumber <= daysInMonth &&
+    hourNumber >= 0 &&
+    hourNumber <= 23 &&
+    minuteNumber >= 0 &&
+    minuteNumber <= 59 &&
+    secondNumber >= 0 &&
+    secondNumber <= 59 &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+function mergeabilityObservation(
+  record: Record<string, unknown>,
+): RepositoryFacts["eligibility"]["mergeability"] {
+  if (record.mergeable === true || record.mergeable === false)
+    return {
+      status: "ready",
+      provenance: "provider",
+      value: record.mergeable ? "mergeable" : null,
+    };
+  return {
+    status: "incomplete",
+    provenance: "provider",
+    error: "exact integration pull request mergeability is incomplete",
   };
 }
 
