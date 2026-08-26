@@ -1,8 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import {
   createGitRunner,
   GitCommandError,
+  type GitRunner,
+  installGitAuthentication,
   RealGitWorkspace,
 } from "../../src/adapters/git.js";
 import {
@@ -267,6 +269,912 @@ describe("real local Git scenario", () => {
         .split("\n")
         .filter(Boolean);
       expect(finalTreePaths).toEqual(["README.md", "people/alice.md"]);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("writes, restarts from, and recovers an H2-refreshed candidate without another write", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const integrationHead = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      await runner.run(["switch", "main"], { cwd: scenario.integrationPath });
+      await runner.run(
+        ["commit", "--allow-empty", "--message", "Advance main"],
+        {
+          cwd: scenario.integrationPath,
+        },
+      );
+      await runner.run(["push", "origin", "HEAD:main"], {
+        cwd: scenario.integrationPath,
+      });
+      const mainOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const cardBytes = new TextEncoder().encode(
+        "---\ngithub_id: 7\nsource_pr: 1\n---\n\n# Candidate Card\n",
+      );
+      const readmeBytes = new TextEncoder().encode(
+        "# Hello from Main\n\n<!-- cards:start -->\nAlice\n<!-- cards:end -->\n",
+      );
+      const write = {
+        input: {
+          observedMainOid: mainOid,
+          expectedIntegrationHeadOid: integrationHead,
+          cardPath: "people/alice.md",
+          cardBytes,
+          readmeBytes,
+        },
+        postconditions: {
+          cardManifest: {
+            path: "people/alice.md",
+            blobOid: gitBlobOid(cardBytes),
+            githubId: "7",
+            sourcePrNumber: 1,
+          },
+          readmeBlobOid: gitBlobOid(readmeBytes),
+          history: {
+            retainCommitOids: [integrationHead],
+            requiredParentOids: [integrationHead],
+          },
+        },
+      };
+      const result =
+        await scenario.botWorkspace.writeIntegrationCandidate(write);
+      expect(result.kind).toBe("succeeded");
+      if (result.kind !== "succeeded") throw new Error("candidate is required");
+      const candidateHead = result.value.integrationHeadOid;
+      if (!candidateHead) throw new Error("candidate head is required");
+      const parents = (
+        await runner.run(["rev-list", "--parents", "-n", "1", candidateHead], {
+          cwd: scenario.integrationPath,
+        })
+      ).stdout
+        .trim()
+        .split(" ")
+        .slice(1)
+        .map(oid);
+      expect(parents).toHaveLength(1);
+      expect(parents[0]).not.toBe(integrationHead);
+      const message = await runner.run(
+        ["show", "-s", "--format=%B", candidateHead],
+        {
+          cwd: scenario.integrationPath,
+        },
+      );
+      expect(message.stdout).toContain(
+        `Hello-From-Main-Required-Parent-Oids: ${parents[0]}`,
+      );
+      const restarted = await new RealGitWorkspace(
+        runner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).readWorkspace();
+      expect(restarted.value?.candidate).toMatchObject({
+        observedOid: candidateHead,
+        mainOid,
+        requiredParentOids: parents,
+      });
+      const legacyMessage = message.stdout.replace(
+        `Hello-From-Main-Required-Parent-Oids: ${parents[0]}`,
+        `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+      );
+      await runner.run(
+        ["commit", "--amend", "--no-edit", "--message", legacyMessage],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      const legacyRestart = await new RealGitWorkspace(
+        runner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).readWorkspace();
+      expect(legacyRestart.value?.candidate).toMatchObject({ mainOid });
+
+      // The legacy shape never bypasses tree/blob bindings.
+      await runner.run(
+        [
+          "commit",
+          "--amend",
+          "--no-edit",
+          "--message",
+          legacyMessage.replace(
+            `Hello-From-Main-Card-Blob-Oid: ${gitBlobOid(cardBytes)}`,
+            "Hello-From-Main-Card-Blob-Oid: wrong-card-blob",
+          ),
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+
+      // All trailer parents must be the pre-refresh Integration ancestor, not
+      // merely any retained ancestor such as main.
+      await runner.run(
+        [
+          "commit",
+          "--amend",
+          "--no-edit",
+          "--message",
+          legacyMessage.replace(
+            `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+            `Hello-From-Main-Required-Parent-Oids: ${mainOid}`,
+          ),
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+
+      const arbitraryRetainedAncestor = oid(
+        (
+          await runner.run(["rev-list", "--max-parents=0", integrationHead], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      await runner.run(
+        [
+          "commit",
+          "--amend",
+          "--no-edit",
+          "--message",
+          legacyMessage.replace(
+            `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+            `Hello-From-Main-Required-Parent-Oids: ${arbitraryRetainedAncestor}`,
+          ),
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+
+      // The H2 refresh tuple is ordered: integration first, current main second.
+      await runner.run(["switch", "-C", "reversed-refresh", mainOid], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["merge", "--no-ff", "--no-edit", integrationHead], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        ["switch", "-C", "feature/card-alice-source-1", "reversed-refresh"],
+        { cwd: scenario.integrationPath },
+      );
+      await writeFile(`${scenario.integrationPath}/people/alice.md`, cardBytes);
+      await writeFile(`${scenario.integrationPath}/README.md`, readmeBytes);
+      await runner.run(["add", "--", "people/alice.md", "README.md"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        [
+          "commit",
+          "--message",
+          "Build candidate Card",
+          "--message",
+          legacyMessage,
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+
+      // A candidate is never a merge commit, even when its tree and trailers
+      // otherwise look like the known H2 shape.
+      await runner.run(["switch", "-c", "unexpected-parent"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        ["commit", "--allow-empty", "--message", "Unexpected parent"],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(["switch", "feature/card-alice-source-1"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["merge", "--no-ff", "--no-edit", "unexpected-parent"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        ["commit", "--amend", "--no-edit", "--message", legacyMessage],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("refreshes a legacy candidate with unchanged rendered files without contaminating its checkout", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const auth = await installGitAuthentication({
+        root: scenario.integrationPath,
+        token: "sanitized-test-token",
+      });
+      try {
+        const runner = createGitRunner({ root: scenario.root, env: auth.env });
+        const workspace = new RealGitWorkspace(
+          runner,
+          scenario.integrationPath,
+          "origin",
+          "feature/card-alice-source-1",
+        );
+        const integrationHead = oid(
+          (
+            await runner.run(
+              ["rev-parse", "origin/feature/card-alice-source-1"],
+              { cwd: scenario.integrationPath },
+            )
+          ).stdout.trim(),
+        );
+        const cardBytes = new TextEncoder().encode(
+          (
+            await runner.run(["show", `${integrationHead}:people/alice.md`], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout,
+        );
+        const readmeBytes = new TextEncoder().encode(
+          (
+            await runner.run(["show", `${integrationHead}:README.md`], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout,
+        );
+        const write = (
+          mainOid: ReturnType<typeof oid>,
+          head: ReturnType<typeof oid>,
+        ) => ({
+          input: {
+            observedMainOid: mainOid,
+            expectedIntegrationHeadOid: head,
+            cardPath: "people/alice.md",
+            cardBytes,
+            readmeBytes,
+          },
+          postconditions: {
+            cardManifest: {
+              path: "people/alice.md",
+              blobOid: gitBlobOid(cardBytes),
+              githubId: "7",
+              sourcePrNumber: 1,
+            },
+            readmeBlobOid: gitBlobOid(readmeBytes),
+            history: {
+              retainCommitOids: [integrationHead],
+              requiredParentOids: [integrationHead],
+            },
+          },
+        });
+        const advanceMain = async (message: string, contents: string) => {
+          await runner.run(["switch", "main"], {
+            cwd: scenario.integrationPath,
+          });
+          await writeFile(
+            `${scenario.integrationPath}/source-only.txt`,
+            contents,
+          );
+          await runner.run(["add", "--", "source-only.txt"], {
+            cwd: scenario.integrationPath,
+          });
+          await runner.run(["commit", "--message", message], {
+            cwd: scenario.integrationPath,
+          });
+          await runner.run(["push", "origin", "HEAD:main"], {
+            cwd: scenario.integrationPath,
+          });
+          return oid(
+            (
+              await runner.run(["rev-parse", "origin/main"], {
+                cwd: scenario.integrationPath,
+              })
+            ).stdout.trim(),
+          );
+        };
+
+        const firstMain = await advanceMain("Advance main source", "one\n");
+        const initial = await workspace.writeIntegrationCandidate(
+          write(firstMain, integrationHead),
+        );
+        expect(initial.kind).toBe("succeeded");
+        if (initial.kind !== "succeeded")
+          throw new Error("candidate is required");
+        const legacyCandidate = initial.value.integrationHeadOid;
+        if (!legacyCandidate) throw new Error("candidate head is required");
+        const firstRefresh = oid(
+          (
+            await runner.run(["rev-parse", "HEAD^"], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout.trim(),
+        );
+        const legacyMessage = (
+          await runner.run(["show", "-s", "--format=%B", legacyCandidate], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.replace(
+          `Hello-From-Main-Required-Parent-Oids: ${firstRefresh}`,
+          `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+        );
+        await runner.run(
+          [
+            "commit",
+            "--amend",
+            "--allow-empty",
+            "--no-edit",
+            "--message",
+            legacyMessage,
+          ],
+          { cwd: scenario.integrationPath },
+        );
+        await runner.run(
+          [
+            "push",
+            "--force-with-lease",
+            "origin",
+            "HEAD:feature/card-alice-source-1",
+          ],
+          { cwd: scenario.integrationPath },
+        );
+        const legacyHead = oid(
+          (
+            await runner.run(
+              ["rev-parse", "origin/feature/card-alice-source-1"],
+              { cwd: scenario.integrationPath },
+            )
+          ).stdout.trim(),
+        );
+        const currentMain = await advanceMain(
+          "Advance main source again",
+          "two\n",
+        );
+
+        const refreshed = await workspace.writeIntegrationCandidate(
+          write(currentMain, legacyHead),
+        );
+        expect(refreshed.kind).toBe("succeeded");
+        if (refreshed.kind !== "succeeded")
+          throw new Error("candidate is required");
+        const candidateHead = refreshed.value.integrationHeadOid;
+        if (!candidateHead) throw new Error("candidate head is required");
+        const candidateParents = (
+          await runner.run(
+            ["rev-list", "--parents", "-n", "1", candidateHead],
+            {
+              cwd: scenario.integrationPath,
+            },
+          )
+        ).stdout
+          .trim()
+          .split(" ")
+          .slice(1)
+          .map(oid);
+        expect(candidateParents).toHaveLength(1);
+        const [refreshCommit] = candidateParents;
+        if (!refreshCommit) throw new Error("refresh commit is required");
+        const refreshParents = (
+          await runner.run(
+            ["rev-list", "--parents", "-n", "1", refreshCommit],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout
+          .trim()
+          .split(" ")
+          .slice(1)
+          .map(oid);
+        expect(refreshParents).toEqual([legacyHead, currentMain]);
+        expect(
+          (
+            await runner.run(
+              [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                refreshCommit,
+                candidateHead,
+              ],
+              {
+                cwd: scenario.integrationPath,
+              },
+            )
+          ).stdout,
+        ).toBe("");
+        expect(
+          await runner.run(["status", "--porcelain"], {
+            cwd: scenario.integrationPath,
+          }),
+        ).toMatchObject({ stdout: "" });
+        await expect(
+          access(`${scenario.integrationPath}/git-askpass.sh`),
+        ).rejects.toBeDefined();
+        expect(refreshed.value.candidate?.mainOid).toBe(currentMain);
+        expect(
+          (
+            await new RealGitWorkspace(
+              runner,
+              scenario.integrationPath,
+              "origin",
+              "feature/card-alice-source-1",
+            ).readWorkspace()
+          ).value?.candidate?.integrationHeadOid,
+        ).toBe(candidateHead);
+        const repeated = await workspace.writeIntegrationCandidate(
+          write(currentMain, candidateHead),
+        );
+        expect(repeated).toMatchObject({
+          kind: "alreadyApplied",
+          value: { integrationHeadOid: candidateHead },
+        });
+      } finally {
+        await auth.dispose();
+      }
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recognizes an H2 candidate after its lease-push response is lost", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const before = await scenario.botWorkspace.readWorkspace();
+      const integrationHead = before.value?.integrationHeadOid;
+      if (!integrationHead) throw new Error("integration head is required");
+      await runner.run(["switch", "main"], { cwd: scenario.integrationPath });
+      await runner.run(
+        ["commit", "--allow-empty", "--message", "Advance main"],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(["push", "origin", "HEAD:main"], {
+        cwd: scenario.integrationPath,
+      });
+      const mainOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      let loseResponse = true;
+      const responseLosingRunner: GitRunner = {
+        async run(argv, options) {
+          const result = await runner.run(argv, options);
+          if (loseResponse && argv[0] === "push") {
+            loseResponse = false;
+            throw new Error("response lost after push");
+          }
+          return result;
+        },
+      };
+      const cardBytes = new TextEncoder().encode(
+        "---\ngithub_id: 7\nsource_pr: 1\n---\n\n# Candidate Card\n",
+      );
+      const readmeBytes = new TextEncoder().encode(
+        "# Hello from Main\n\n<!-- cards:start -->\nAlice\n<!-- cards:end -->\n",
+      );
+      const result = await new RealGitWorkspace(
+        responseLosingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).writeIntegrationCandidate({
+        input: {
+          observedMainOid: mainOid,
+          expectedIntegrationHeadOid: integrationHead,
+          cardPath: "people/alice.md",
+          cardBytes,
+          readmeBytes,
+        },
+        postconditions: {
+          cardManifest: {
+            path: "people/alice.md",
+            blobOid: gitBlobOid(cardBytes),
+            githubId: "7",
+            sourcePrNumber: 1,
+          },
+          readmeBlobOid: gitBlobOid(readmeBytes),
+          history: {
+            retainCommitOids: [integrationHead],
+            requiredParentOids: [integrationHead],
+          },
+        },
+      });
+      expect(result.kind).toBe("alreadyApplied");
+      if (result.kind !== "alreadyApplied")
+        throw new Error("candidate should be recovered");
+      expect(result.value.candidate?.mainOid).toBe(mainOid);
+      expect(
+        oid(
+          (
+            await runner.run(
+              ["rev-parse", "origin/feature/card-alice-source-1"],
+              { cwd: scenario.integrationPath },
+            )
+          ).stdout.trim(),
+        ),
+      ).toBe(result.value.integrationHeadOid);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recognizes a legacy H2 candidate after its lease-push response is lost", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const before = await scenario.botWorkspace.readWorkspace();
+      const integrationHead = before.value?.integrationHeadOid;
+      if (!integrationHead) throw new Error("integration head is required");
+      await runner.run(["switch", "main"], { cwd: scenario.integrationPath });
+      await runner.run(
+        ["commit", "--allow-empty", "--message", "Advance main"],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(["push", "origin", "HEAD:main"], {
+        cwd: scenario.integrationPath,
+      });
+      const mainOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      let loseResponse = true;
+      const responseLosingRunner: GitRunner = {
+        async run(argv, options) {
+          const result = await runner.run(argv, options);
+          if (loseResponse && argv[0] === "push") {
+            loseResponse = false;
+            const message = await runner.run(
+              ["show", "-s", "--format=%B", "HEAD"],
+              { cwd: scenario.integrationPath },
+            );
+            const parent = oid(
+              (
+                await runner.run(["rev-parse", "HEAD^"], {
+                  cwd: scenario.integrationPath,
+                })
+              ).stdout.trim(),
+            );
+            await runner.run(
+              [
+                "commit",
+                "--amend",
+                "--no-edit",
+                "--message",
+                message.stdout.replace(
+                  `Hello-From-Main-Required-Parent-Oids: ${parent}`,
+                  `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+                ),
+              ],
+              { cwd: scenario.integrationPath },
+            );
+            await runner.run(
+              [
+                "push",
+                "--force-with-lease",
+                "origin",
+                "HEAD:feature/card-alice-source-1",
+              ],
+              { cwd: scenario.integrationPath },
+            );
+            throw new Error("response lost after push");
+          }
+          return result;
+        },
+      };
+      const cardBytes = new TextEncoder().encode(
+        "---\ngithub_id: 7\nsource_pr: 1\n---\n\n# Candidate Card\n",
+      );
+      const readmeBytes = new TextEncoder().encode(
+        "# Hello from Main\n\n<!-- cards:start -->\nAlice\n<!-- cards:end -->\n",
+      );
+      const result = await new RealGitWorkspace(
+        responseLosingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).writeIntegrationCandidate({
+        input: {
+          observedMainOid: mainOid,
+          expectedIntegrationHeadOid: integrationHead,
+          cardPath: "people/alice.md",
+          cardBytes,
+          readmeBytes,
+        },
+        postconditions: {
+          cardManifest: {
+            path: "people/alice.md",
+            blobOid: gitBlobOid(cardBytes),
+            githubId: "7",
+            sourcePrNumber: 1,
+          },
+          readmeBlobOid: gitBlobOid(readmeBytes),
+          history: {
+            retainCommitOids: [integrationHead],
+            requiredParentOids: [integrationHead],
+          },
+        },
+      });
+      expect(result.kind).toBe("alreadyApplied");
+      if (result.kind !== "alreadyApplied")
+        throw new Error("legacy candidate should be recovered");
+      expect(result.value.candidate?.mainOid).toBe(mainOid);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("rejects candidates that add, alter, or remove unrelated tree entries", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      await runner.run(["switch", "feature/card-alice-source-1"], {
+        cwd: scenario.integrationPath,
+      });
+      await writeFile(`${scenario.integrationPath}/stable.txt`, "stable\n");
+      await runner.run(["add", "--", "stable.txt"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["commit", "--message", "Add stable file"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["push", "origin", "HEAD:feature/card-alice-source-1"], {
+        cwd: scenario.integrationPath,
+      });
+      const integrationHead = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const mainOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const cardBytes = new TextEncoder().encode(
+        "---\ngithub_id: 7\nsource_pr: 1\n---\n\n# Candidate Card\n",
+      );
+      const readmeBytes = new TextEncoder().encode(
+        "# Hello from Main\n\n<!-- cards:start -->\nAlice\n<!-- cards:end -->\n",
+      );
+      const result = await scenario.botWorkspace.writeIntegrationCandidate({
+        input: {
+          observedMainOid: mainOid,
+          expectedIntegrationHeadOid: integrationHead,
+          cardPath: "people/alice.md",
+          cardBytes,
+          readmeBytes,
+        },
+        postconditions: {
+          cardManifest: {
+            path: "people/alice.md",
+            blobOid: gitBlobOid(cardBytes),
+            githubId: "7",
+            sourcePrNumber: 1,
+          },
+          readmeBlobOid: gitBlobOid(readmeBytes),
+          history: {
+            retainCommitOids: [integrationHead],
+            requiredParentOids: [integrationHead],
+          },
+        },
+      });
+      if (result.kind !== "succeeded") throw new Error("candidate is required");
+      const candidateHead = result.value.integrationHeadOid;
+      if (!candidateHead) throw new Error("candidate head is required");
+      await writeFile(
+        `${scenario.integrationPath}/unexpected.txt`,
+        "unexpected\n",
+      );
+      await runner.run(["add", "--", "unexpected.txt"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["commit", "--amend", "--no-edit"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+      await runner.run(
+        ["switch", "-C", "feature/card-alice-source-1", candidateHead],
+        { cwd: scenario.integrationPath },
+      );
+      await writeFile(`${scenario.integrationPath}/stable.txt`, "altered\n");
+      await runner.run(["add", "--", "stable.txt"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["commit", "--amend", "--no-edit"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
+      await runner.run(
+        ["switch", "-C", "feature/card-alice-source-1", candidateHead],
+        { cwd: scenario.integrationPath },
+      );
+      await runner.run(["rm", "--", "stable.txt"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(["commit", "--amend", "--no-edit"], {
+        cwd: scenario.integrationPath,
+      });
+      await runner.run(
+        [
+          "push",
+          "--force-with-lease",
+          "origin",
+          "HEAD:feature/card-alice-source-1",
+        ],
+        { cwd: scenario.integrationPath },
+      );
+      expect(
+        (
+          await new RealGitWorkspace(
+            runner,
+            scenario.integrationPath,
+            "origin",
+            "feature/card-alice-source-1",
+          ).readWorkspace()
+        ).value?.candidate,
+      ).toBeUndefined();
     } finally {
       await scenario.dispose();
     }

@@ -120,26 +120,44 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 function createGitAuthenticationEnv(input) {
   if (!input.token) throw new Error("Git authentication token is required");
-  const askpass = join(input.root, "git-askpass.sh");
   return {
     env: {
-      GIT_ASKPASS: askpass,
+      GIT_ASKPASS: input.helperPath,
       GIT_TERMINAL_PROMPT: "0",
       HELLO_FROM_MAIN_GIT_TOKEN: input.token
     },
-    dispose: async () => rm(askpass, { force: true })
+    // This low-level constructor owns no filesystem resource.
+    dispose: async () => void 0
   };
 }
 async function installGitAuthentication(input) {
-  const auth = createGitAuthenticationEnv(input);
-  await mkdir(input.root, { recursive: true });
-  await writeFile(
-    join(input.root, "git-askpass.sh"),
-    '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
-    { mode: 448 }
-  );
-  await chmod(join(input.root, "git-askpass.sh"), 448);
-  return auth;
+  let directory;
+  try {
+    directory = await mkdtemp(join(tmpdir(), "hello-from-main-git-auth-"));
+    await chmod(directory, 448);
+    const askpass = join(directory, "git-askpass.sh");
+    const auth = createGitAuthenticationEnv({
+      token: input.token,
+      helperPath: askpass
+    });
+    await writeFile(
+      askpass,
+      '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
+      { mode: 448 }
+    );
+    await chmod(askpass, 448);
+    return {
+      ...auth,
+      // This disposer owns the directory allocated by this installation.
+      dispose: async () => rm(directory, { force: true, recursive: true })
+    };
+  } catch (error) {
+    if (directory)
+      await rm(directory, { force: true, recursive: true }).catch(
+        () => void 0
+      );
+    throw error;
+  }
 }
 function createGitRunner(input) {
   return {
@@ -237,6 +255,10 @@ async function runGit(root, argv, options) {
 async function git(runner, cwd, ...argv) {
   return (await runner.run(argv, { cwd })).stdout.trim();
 }
+function gitCommandFailureDetail(error) {
+  const operation = error.result.argv[0] ?? "unknown";
+  return `operation=${operation}; status=${error.result.status}; category=local-git`;
+}
 function oidFromBytes(bytes) {
   const header = Buffer.from(`blob ${bytes.byteLength}\0`);
   return oid(createHash2("sha1").update(header).update(bytes).digest("hex"));
@@ -250,6 +272,8 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
   } catch {
     return void 0;
   }
+  if (!mainOid) return void 0;
+  const observedMainOid = mainOid;
   const cardBlobOid = oid(
     await git(
       runner,
@@ -258,11 +282,26 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
       `${head}:${trailers.cardManifest.path}`
     )
   );
-  if (cardBlobOid !== trailers.cardManifest.blobOid || readmeBlobOid !== trailers.readmeBlobOid || !trailers.history.retainCommitOids.every(
+  const canonicalParentContract = trailers.history.requiredParentOids.length === 1 && requiredParentOids.length === 1 && trailers.history.requiredParentOids[0] === requiredParentOids[0];
+  const legacyH2ParentContract = !canonicalParentContract && await legacyH2CandidateParentContract(
+    runner,
+    cwd,
+    trailers.history.requiredParentOids,
+    trailers.history.retainCommitOids,
+    requiredParentOids,
+    retainedCommitOids,
+    observedMainOid
+  );
+  const treeDeltaIsExact = await candidateTreeDeltaIsExact(
+    runner,
+    cwd,
+    head,
+    requiredParentOids,
+    trailers.cardManifest.path
+  );
+  if (cardBlobOid !== trailers.cardManifest.blobOid || readmeBlobOid !== trailers.readmeBlobOid || trailers.mainOid !== observedMainOid || !trailers.history.retainCommitOids.every(
     (commit) => retainedCommitOids.includes(commit)
-  ) || !trailers.history.requiredParentOids.every(
-    (parent) => requiredParentOids.includes(parent)
-  ))
+  ) || !treeDeltaIsExact || !canonicalParentContract && !legacyH2ParentContract)
     return void 0;
   const readmeBytes = new TextEncoder().encode(
     (await runner.run(["show", `${head}:README.md`], { cwd })).stdout
@@ -271,7 +310,7 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
     observedOid: head,
     provenance: "observed",
     integrationHeadOid: head,
-    mainOid: trailers.mainOid ?? mainOid,
+    mainOid: trailers.mainOid,
     cardPath: trailers.cardManifest.path,
     cardBlobOid,
     readmeBlobOid,
@@ -279,6 +318,34 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
     retainedCommitOids,
     requiredParentOids
   };
+}
+async function candidateTreeDeltaIsExact(runner, cwd, head, candidateParents, cardPath) {
+  const [parent] = candidateParents;
+  if (candidateParents.length !== 1 || !parent) return false;
+  const changedPaths = (await git(
+    runner,
+    cwd,
+    "diff-tree",
+    "--no-commit-id",
+    "--name-only",
+    "-r",
+    parent,
+    head
+  )).split("\n").filter(Boolean);
+  return changedPaths.every(
+    (path) => path === cardPath || path === "README.md"
+  );
+}
+async function legacyH2CandidateParentContract(runner, cwd, trailerRequiredParentOids, trailerRetainCommitOids, candidateParents, retainedCommitOids, mainOid) {
+  const [trailerRequiredParentOid] = trailerRequiredParentOids;
+  const [preRefreshIntegrationOid] = trailerRetainCommitOids;
+  const [candidateParent] = candidateParents;
+  if (trailerRequiredParentOids.length !== 1 || candidateParents.length !== 1 || !trailerRequiredParentOid || !preRefreshIntegrationOid || !candidateParent || trailerRequiredParentOid === mainOid || trailerRequiredParentOid !== preRefreshIntegrationOid || !trailerRequiredParentOids.every(
+    (parent) => retainedCommitOids.includes(parent)
+  ))
+    return false;
+  const refreshParents = (await git(runner, cwd, "rev-list", "--parents", "-n", "1", candidateParent)).split(" ").slice(1).filter(Boolean).map(oid);
+  return refreshParents.length === 2 && refreshParents[0] === preRefreshIntegrationOid && refreshParents[1] === mainOid;
 }
 function candidateCommitTrailers(candidate, parent) {
   const { cardManifest, readmeBlobOid, history } = candidate.postconditions;
@@ -323,13 +390,28 @@ function parseCandidateTrailers(commit) {
     }
   };
 }
-function candidateMatches(readback, candidate) {
+async function candidateMatches(runner, cwd, readback, candidate) {
   const actual = readback.candidate;
-  return actual?.cardPath === candidate.postconditions.cardManifest.path && actual.cardBlobOid === candidate.postconditions.cardManifest.blobOid && actual.readmeBlobOid === candidate.postconditions.readmeBlobOid && candidate.postconditions.history.retainCommitOids.every(
-    (commit) => readback.retainedCommitOids?.includes(commit)
-  ) && candidate.postconditions.history.requiredParentOids.every(
-    (parent) => actual.requiredParentOids?.includes(parent)
+  const head = readback.integrationHeadOid;
+  const readmeBlobOid = readback.readmeBlobOid;
+  const retainedCommitOids = readback.retainedCommitOids;
+  const requiredParentOids = readback.requiredParentOids;
+  if (!actual || !head || !readmeBlobOid || !retainedCommitOids || !requiredParentOids)
+    return false;
+  const validated = await candidateFromCommit(
+    runner,
+    cwd,
+    head,
+    readmeBlobOid,
+    retainedCommitOids,
+    requiredParentOids,
+    candidate.input.observedMainOid
   );
+  return validated?.mainOid === candidate.input.observedMainOid && validated.cardPath === candidate.postconditions.cardManifest.path && validated.cardBlobOid === candidate.postconditions.cardManifest.blobOid && validated.readmeBlobOid === candidate.postconditions.readmeBlobOid && candidate.postconditions.history.retainCommitOids.every(
+    (commit) => retainedCommitOids.includes(commit)
+  ) && validated.requiredParentOids?.length === 1 && (candidate.postconditions.history.requiredParentOids.length === 0 || candidate.postconditions.history.requiredParentOids.every(
+    (parent) => retainedCommitOids.includes(parent)
+  ));
 }
 async function isAncestor(runner, cwd, ancestor, descendant) {
   try {
@@ -383,6 +465,7 @@ var init_git = __esm({
       "update-ref",
       "cat-file",
       "diff",
+      "diff-tree",
       "rev-list"
     ]);
     legacyCandidateManifestPath = ".hello-from-main/candidate.json";
@@ -605,6 +688,14 @@ var init_git = __esm({
           );
           if (observedMain !== candidate.input.observedMainOid)
             return { kind: "staleMain" };
+          const existing = await this.readWorkspace().catch(() => void 0);
+          if (existing?.value && await candidateMatches(
+            this.runner,
+            this.cwd,
+            existing.value,
+            candidate
+          ))
+            return { kind: "alreadyApplied", value: existing.value };
           if (!await isAncestor(this.runner, this.cwd, observedMain, current)) {
             await git(
               this.runner,
@@ -635,31 +726,38 @@ var init_git = __esm({
             candidate.input.cardPath,
             "README.md"
           );
-          if (await git(this.runner, this.cwd, "status", "--short")) {
+          const candidateParentOid = oid(
+            await git(this.runner, this.cwd, "rev-parse", "HEAD")
+          );
+          await git(
+            this.runner,
+            this.cwd,
+            "commit",
+            "--allow-empty",
+            "--message",
+            "Build candidate Card",
+            "--message",
+            candidateCommitTrailers(candidate, candidateParentOid)
+          );
+          try {
             await git(
               this.runner,
               this.cwd,
-              "commit",
-              "--message",
-              "Build candidate Card",
-              "--message",
-              candidateCommitTrailers(candidate, current)
+              "push",
+              "--force-with-lease",
+              this.remote,
+              `${this.branch}:${this.branch}`
             );
-            try {
-              await git(
-                this.runner,
-                this.cwd,
-                "push",
-                "--force-with-lease",
-                this.remote,
-                `${this.branch}:${this.branch}`
-              );
-            } catch {
-              const readback2 = await this.readWorkspace().catch(() => void 0);
-              if (readback2?.value && candidateMatches(readback2.value, candidate))
-                return { kind: "alreadyApplied", value: readback2.value };
-              return { kind: "retryableTransport" };
-            }
+          } catch {
+            const readback2 = await this.readWorkspace().catch(() => void 0);
+            if (readback2?.value && await candidateMatches(
+              this.runner,
+              this.cwd,
+              readback2.value,
+              candidate
+            ))
+              return { kind: "alreadyApplied", value: readback2.value };
+            return { kind: "retryableTransport" };
           }
           const head = oid(await git(this.runner, this.cwd, "rev-parse", "HEAD"));
           const cardBlob = oid(
@@ -699,12 +797,24 @@ var init_git = __esm({
             "1",
             "HEAD"
           )).split(" ").slice(1).map(oid);
-          if (!candidate.postconditions.history.requiredParentOids.every(
-            (parent) => requiredParentOids.includes(parent)
-          ))
+          if (requiredParentOids.length !== 1)
             return {
               kind: "policyPostcondition",
-              detail: "immediate parent mismatch"
+              detail: "candidate must have one immediate parent"
+            };
+          const parsedCandidate = await candidateFromCommit(
+            this.runner,
+            this.cwd,
+            head,
+            readmeBlob,
+            retainedCommitOids,
+            requiredParentOids,
+            candidate.input.observedMainOid
+          );
+          if (!parsedCandidate)
+            return {
+              kind: "policyPostcondition",
+              detail: "candidate tree or parent contract mismatch"
             };
           const readback = {
             status: "ready",
@@ -725,8 +835,11 @@ var init_git = __esm({
             retainedCommitOids
           };
           return { kind: "succeeded", value: readback };
-        } catch {
-          return { kind: "unknownOutcome" };
+        } catch (error) {
+          return {
+            kind: "unknownOutcome",
+            ...error instanceof GitCommandError ? { detail: gitCommandFailureDetail(error) } : {}
+          };
         }
       }
       async readFinalMainPostconditions(expected, context) {
@@ -4020,55 +4133,55 @@ async function runProductionComposition(input) {
     root: workspace,
     token
   });
-  const sourceContext = {
-    signal: new AbortController().signal,
-    expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
-    expectedSourceLogin: runtime.sourceLogin
-  };
-  let repositoryId;
   try {
-    repositoryId = await trustedRepositoryId(transport, owner, repo);
-  } catch {
-    process.stdout.write(
-      `${JSON.stringify({
-        kind: "hello-from-main-diagnostic",
-        stage: "pre-composition",
-        outcome: "terminal",
-        reason: "capabilityUnavailable"
-      })}
+    const sourceContext = {
+      signal: new AbortController().signal,
+      expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
+      expectedSourceLogin: runtime.sourceLogin
+    };
+    let repositoryId;
+    try {
+      repositoryId = await trustedRepositoryId(transport, owner, repo);
+    } catch {
+      process.stdout.write(
+        `${JSON.stringify({
+          kind: "hello-from-main-diagnostic",
+          stage: "pre-composition",
+          outcome: "terminal",
+          reason: "capabilityUnavailable"
+        })}
 `
-    );
-    throw new Error("trusted repository identity is unavailable");
-  }
-  const composition = createActionComposition({
-    context,
-    github: bindProductionSetup(
-      createOctokitGithubPlatform({
-        owner,
-        repo,
-        transport,
-        ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
-        repositoryId,
-        expectedCommentOwner: runtime.commentOwner
-      }),
-      runtime,
-      new RealGitWorkspace(
+      );
+      throw new Error("trusted repository identity is unavailable");
+    }
+    const composition = createActionComposition({
+      context,
+      github: bindProductionSetup(
+        createOctokitGithubPlatform({
+          owner,
+          repo,
+          transport,
+          ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
+          repositoryId,
+          expectedCommentOwner: runtime.commentOwner
+        }),
+        runtime,
+        new RealGitWorkspace(
+          createGitRunner({ root: workspace, env: gitAuth.env }),
+          workspace,
+          runtime.remote,
+          runtime.branch
+        )
+      ),
+      git: new RealGitWorkspace(
         createGitRunner({ root: workspace, env: gitAuth.env }),
         workspace,
         runtime.remote,
         runtime.branch
-      )
-    ),
-    git: new RealGitWorkspace(
-      createGitRunner({ root: workspace, env: gitAuth.env }),
-      workspace,
-      runtime.remote,
-      runtime.branch
-    ),
-    candidatePolicy: productionCandidatePolicy,
-    invocationContext: sourceContext
-  });
-  try {
+      ),
+      candidatePolicy: productionCandidatePolicy,
+      invocationContext: sourceContext
+    });
     const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
       process.stdout.write(
         `${JSON.stringify({
