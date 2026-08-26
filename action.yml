@@ -1,0 +1,8 @@
+name: Hello from Main
+description: Trusted default-branch controller entry point
+runs:
+  using: node24
+  main: tools/dist/index.js
+branding:
+  color: blue
+  icon: git-pull-request

@@ -1,0 +1,18 @@
+name: Hello from Main CI
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+concurrency:
+  group: hello-from-main-ci
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify trusted source
+        run: node --version

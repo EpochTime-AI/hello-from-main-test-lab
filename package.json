@@ -1,0 +1,28 @@
+{
+  "name": "hello-from-main",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "verify:local": "vitest run test/local",
+    "verify:adapters": "vitest run test/adapters test/runtime && node tools/check-workflows.mjs",
+    "verify:stability": "vitest run --config test/stability/vitest.config.ts",
+    "build": "node tools/build.mjs",
+    "check:dist": "node tools/check-dist.mjs",
+    "verify:pre-canary": "npm run typecheck && npm run lint && npm test -- --run && npm run verify:local && npm run verify:adapters && npm run verify:stability && npm run build && npm run check:dist",
+    "format": "biome format --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

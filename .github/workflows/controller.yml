@@ -1,0 +1,35 @@
+name: Hello from Main controller
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+concurrency:
+  group: hello-from-main-publication
+  cancel-in-progress: false
+jobs:
+  controller:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.base.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run trusted controller
+        uses: ./
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: main
+          HELLO_FROM_MAIN_TRUSTED_SOURCE_REF: refs/heads/main
+          HELLO_FROM_MAIN_WORKSPACE: ${{ github.workspace }}
+          HELLO_FROM_MAIN_REMOTE: origin
+          HELLO_FROM_MAIN_SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          HELLO_FROM_MAIN_SOURCE_LOGIN: ${{ github.event.pull_request.user.login }}
+          HELLO_FROM_MAIN_COMMENT_OWNER_ID: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_ID }}
+          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE }}

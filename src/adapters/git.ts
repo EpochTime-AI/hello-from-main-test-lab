@@ -1,0 +1,962 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type {
+  CandidateWrite,
+  CandidateWriteResult,
+  CardManifest,
+  FinalMainPostconditions,
+  Observation,
+  Oid,
+  WorkspaceReadback,
+} from "../core/model.js";
+import { oid } from "../core/model.js";
+
+const allowed = new Set([
+  "--version",
+  "init",
+  "clone",
+  "config",
+  "switch",
+  "checkout",
+  "add",
+  "commit",
+  "branch",
+  "fetch",
+  "rebase",
+  "status",
+  "ls-files",
+  "rev-parse",
+  "show",
+  "ls-tree",
+  "log",
+  "merge",
+  "merge-base",
+  "--no-ff",
+  "push",
+  "remote",
+  "rm",
+  "update-ref",
+  "cat-file",
+  "diff",
+  "rev-list",
+]);
+const legacyCandidateManifestPath = ".hello-from-main/candidate.json";
+
+export type GitResult = {
+  commandId: string;
+  argv: readonly string[];
+  cwd: string;
+  stdout: string;
+  stderr: string;
+  status: number;
+};
+export class GitCommandError extends Error {
+  constructor(public readonly result: GitResult) {
+    super(
+      `git ${result.argv.join(" ")} exited ${result.status}: ${result.stderr.trim()}`,
+    );
+  }
+}
+export type GitRunner = {
+  run(
+    argv: readonly string[],
+    options: {
+      cwd: string;
+      env?: Record<string, string | undefined>;
+      signal?: AbortSignal;
+    },
+  ): Promise<GitResult>;
+};
+
+export type GitAuthentication = {
+  token: string;
+};
+
+export function createGitAuthenticationEnv(
+  input: GitAuthentication & { root: string },
+): {
+  env: Record<string, string>;
+  dispose: () => Promise<void>;
+} {
+  if (!input.token) throw new Error("Git authentication token is required");
+  const askpass = join(input.root, "git-askpass.sh");
+  return {
+    env: {
+      GIT_ASKPASS: askpass,
+      GIT_TERMINAL_PROMPT: "0",
+      HELLO_FROM_MAIN_GIT_TOKEN: input.token,
+    },
+    dispose: async () => rm(askpass, { force: true }),
+  };
+}
+
+export async function installGitAuthentication(
+  input: GitAuthentication & { root: string },
+) {
+  const auth = createGitAuthenticationEnv(input);
+  await mkdir(input.root, { recursive: true });
+  await writeFile(
+    join(input.root, "git-askpass.sh"),
+    '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
+    { mode: 0o700 },
+  );
+  await chmod(join(input.root, "git-askpass.sh"), 0o700);
+  return auth;
+}
+
+let nextCommand = 0;
+export function createGitRunner(input: {
+  root: string;
+  env?: Record<string, string | undefined>;
+}): GitRunner {
+  return {
+    run: (argv, options) =>
+      runGit(input.root, argv, {
+        ...options,
+        env: { ...input.env, ...options.env },
+      }),
+  };
+}
+
+async function runGit(
+  root: string,
+  argv: readonly string[],
+  options: {
+    cwd: string;
+    env?: Record<string, string | undefined>;
+    signal?: AbortSignal;
+  },
+): Promise<GitResult> {
+  if (
+    argv.length === 0 ||
+    !allowed.has(argv[0] ?? "") ||
+    argv.some((arg) => arg.includes("\0"))
+  ) {
+    throw new GitCommandError({
+      commandId: `git-${++nextCommand}`,
+      argv,
+      cwd: options.cwd,
+      stdout: "",
+      stderr: "command not allowlisted",
+      status: 126,
+    });
+  }
+  const home = join(root, "home");
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...options.env,
+    HOME: home,
+    GIT_CONFIG_NOSYSTEM: "1",
+    LC_ALL: "C",
+    LANG: "C",
+    TZ: "UTC",
+    GIT_CONFIG_COUNT: "8",
+    GIT_CONFIG_KEY_0: "user.name",
+    GIT_CONFIG_VALUE_0: "Hello from Main Bot",
+    GIT_CONFIG_KEY_1: "user.email",
+    GIT_CONFIG_VALUE_1: "bot@example.invalid",
+    GIT_CONFIG_KEY_2: "core.hooksPath",
+    GIT_CONFIG_VALUE_2: "/dev/null",
+    GIT_CONFIG_KEY_3: "commit.gpgSign",
+    GIT_CONFIG_VALUE_3: "false",
+    GIT_CONFIG_KEY_4: "tag.gpgSign",
+    GIT_CONFIG_VALUE_4: "false",
+    GIT_CONFIG_KEY_5: "core.autocrlf",
+    GIT_CONFIG_VALUE_5: "false",
+    GIT_CONFIG_KEY_6: "core.filemode",
+    GIT_CONFIG_VALUE_6: "false",
+    GIT_CONFIG_KEY_7: "gc.auto",
+    GIT_CONFIG_VALUE_7: "0",
+  };
+  const commandId = `git-${++nextCommand}`;
+  const result = await new Promise<GitResult>((resolve, reject) => {
+    const child = spawn("git", argv, {
+      cwd: options.cwd,
+      env,
+      shell: false,
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    let spawnError: Error | undefined;
+    const abort = () => child.kill("SIGTERM");
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("close", (status) => {
+      options.signal?.removeEventListener("abort", abort);
+      if (spawnError) {
+        reject(spawnError);
+        return;
+      }
+      resolve({
+        commandId,
+        argv,
+        cwd: options.cwd,
+        stdout,
+        stderr,
+        status: status ?? 1,
+      });
+    });
+  });
+  const token = options.env?.HELLO_FROM_MAIN_GIT_TOKEN;
+  if (token) {
+    result.stdout = result.stdout.split(token).join("[REDACTED]");
+    result.stderr = result.stderr.split(token).join("[REDACTED]");
+  }
+  if (result.status !== 0) throw new GitCommandError(result);
+  return result;
+}
+
+export async function git(
+  runner: GitRunner,
+  cwd: string,
+  ...argv: string[]
+): Promise<string> {
+  return (await runner.run(argv, { cwd })).stdout.trim();
+}
+
+export type ConflictInspection = {
+  path: string;
+  stages: { 2: string; 3: string };
+  rebaseHead: string;
+};
+export class ContributorGitDriver {
+  constructor(
+    private readonly runner: GitRunner,
+    private readonly cwd: string,
+    private readonly branch: string,
+  ) {}
+  async fetchAndRebase(): Promise<void> {
+    await git(this.runner, this.cwd, "fetch", "upstream");
+    await git(
+      this.runner,
+      this.cwd,
+      "rebase",
+      "upstream/feature/card-alice-source-1",
+    );
+  }
+  async rebaseAndInspectConflict(): Promise<ConflictInspection> {
+    try {
+      await this.fetchAndRebase();
+    } catch (error) {
+      if (!(error instanceof GitCommandError)) throw error;
+      const stages = await this.runner.run(
+        ["ls-files", "--stage", "--", "people/alice.md"],
+        { cwd: this.cwd },
+      );
+      const lines = stages.stdout.split("\n").filter(Boolean);
+      const content = async (stage: string) =>
+        readFile(join(this.cwd, "people/alice.md"), "utf8").catch(() => stage);
+      const ours = await git(
+        this.runner,
+        this.cwd,
+        "show",
+        ":2:people/alice.md",
+      );
+      const theirs = await git(
+        this.runner,
+        this.cwd,
+        "show",
+        ":3:people/alice.md",
+      );
+      const rebaseHead = await git(
+        this.runner,
+        this.cwd,
+        "rev-parse",
+        "REBASE_HEAD",
+      );
+      void lines;
+      void content;
+      return {
+        path: "people/alice.md",
+        stages: { 2: ours, 3: theirs },
+        rebaseHead,
+      };
+    }
+    throw new Error("expected add/add conflict");
+  }
+  async resolveCard(bytes: Uint8Array): Promise<void> {
+    await writeFile(join(this.cwd, "people/alice.md"), bytes);
+    await git(this.runner, this.cwd, "add", "--", "people/alice.md");
+  }
+  async continueRebase(): Promise<void> {
+    await git(this.runner, this.cwd, "rebase", "--continue");
+  }
+  async pushForceWithLease(): Promise<void> {
+    await git(
+      this.runner,
+      this.cwd,
+      "push",
+      "--force-with-lease",
+      "origin",
+      `${this.branch}:${this.branch}`,
+    );
+  }
+}
+
+export class RealGitWorkspace {
+  private activeSignal: AbortSignal | undefined;
+  private readonly runner: GitRunner;
+
+  constructor(
+    runner: GitRunner,
+    private readonly cwd: string,
+    private readonly remote: string,
+    private readonly branch: string,
+  ) {
+    this.runner = {
+      run: (argv, options) =>
+        runner.run(argv, {
+          ...options,
+          ...(this.activeSignal ? { signal: this.activeSignal } : {}),
+        }),
+    };
+  }
+
+  async createIntegrationBranchWithProjectShell(input: {
+    name: string;
+    fromMainOid: Oid;
+    cardPath: string;
+    cardBytes: Uint8Array;
+  }) {
+    const main = oid(
+      await git(this.runner, this.cwd, "rev-parse", "origin/main"),
+    );
+    if (main !== input.fromMainOid) throw new Error("stale main setup target");
+    const existing = await git(
+      this.runner,
+      this.cwd,
+      "rev-parse",
+      `origin/${input.name}`,
+    ).catch(() => undefined);
+    if (existing) {
+      const existingCard = await git(
+        this.runner,
+        this.cwd,
+        "rev-parse",
+        `${existing}:${input.cardPath}`,
+      ).catch(() => undefined);
+      if (existingCard === oidFromBytes(input.cardBytes))
+        return {
+          branch: {
+            name: input.name,
+            headOid: oid(existing),
+            provenance: "observed" as const,
+          },
+        };
+    }
+    await git(this.runner, this.cwd, "switch", "-C", input.name, "origin/main");
+    await mkdir(dirname(join(this.cwd, input.cardPath)), { recursive: true });
+    await writeFile(join(this.cwd, input.cardPath), input.cardBytes);
+    await git(this.runner, this.cwd, "add", "--", input.cardPath);
+    await git(
+      this.runner,
+      this.cwd,
+      "commit",
+      "--message",
+      "Create Project Shell",
+    );
+    await git(
+      this.runner,
+      this.cwd,
+      "push",
+      "--force-with-lease",
+      this.remote,
+      `HEAD:${input.name}`,
+    );
+    return {
+      branch: {
+        name: input.name,
+        headOid: oid(await git(this.runner, this.cwd, "rev-parse", "HEAD")),
+        provenance: "observed" as const,
+      },
+    };
+  }
+  async readWorkspace(context?: {
+    signal: AbortSignal;
+  }): Promise<Observation<WorkspaceReadback>> {
+    this.activeSignal = context?.signal;
+    await git(this.runner, this.cwd, "fetch", this.remote).catch(
+      () => undefined,
+    );
+    const remoteHead = await git(
+      this.runner,
+      this.cwd,
+      "rev-parse",
+      `origin/${this.branch}`,
+    ).catch(() => undefined);
+    if (!remoteHead) {
+      const repository = await git(
+        this.runner,
+        this.cwd,
+        "rev-parse",
+        "--is-inside-work-tree",
+      ).catch(() => undefined);
+      if (repository !== "true") return { status: "readFailed" };
+      return { status: "ready", value: { status: "ready" } };
+    }
+    const head = oid(remoteHead);
+    const mainOid = await git(this.runner, this.cwd, "rev-parse", "origin/main")
+      .then(oid)
+      .catch(() => undefined);
+    const readmeBlobOid = oid(
+      await git(this.runner, this.cwd, "rev-parse", `${head}:README.md`),
+    );
+    const retainedCommitOids = (
+      await git(this.runner, this.cwd, "rev-list", head)
+    )
+      .split("\n")
+      .filter(Boolean)
+      .map(oid);
+    const parents = (
+      await git(this.runner, this.cwd, "rev-list", "--parents", "-n", "1", head)
+    )
+      .split(" ")
+      .slice(1)
+      .filter(Boolean)
+      .map(oid);
+    const candidate = await candidateFromCommit(
+      this.runner,
+      this.cwd,
+      head,
+      readmeBlobOid,
+      retainedCommitOids,
+      parents,
+      mainOid,
+    );
+    return {
+      status: "ready",
+      value: {
+        status: "ready",
+        integrationHeadOid: head,
+        ...(candidate ? { candidate } : {}),
+        readmeBlobOid,
+        retainedCommitOids,
+        requiredParentOids: parents,
+      },
+    };
+  }
+  async writeIntegrationCandidate(
+    candidate: CandidateWrite,
+    context?: { signal: AbortSignal },
+  ): Promise<CandidateWriteResult> {
+    this.activeSignal = context?.signal;
+    try {
+      const current = oid(
+        await git(this.runner, this.cwd, "rev-parse", `origin/${this.branch}`),
+      );
+      await git(this.runner, this.cwd, "switch", "-C", this.branch, current);
+      if (current !== candidate.input.expectedIntegrationHeadOid)
+        return { kind: "staleLease" };
+      const observedMain = oid(
+        await git(this.runner, this.cwd, "rev-parse", `origin/main`),
+      );
+      if (observedMain !== candidate.input.observedMainOid)
+        return { kind: "staleMain" };
+      if (!(await isAncestor(this.runner, this.cwd, observedMain, current))) {
+        await git(
+          this.runner,
+          this.cwd,
+          "merge",
+          "--no-ff",
+          "--no-edit",
+          candidate.input.observedMainOid,
+        );
+      }
+      const cardPath = join(this.cwd, candidate.input.cardPath);
+      await mkdir(dirname(cardPath), { recursive: true });
+      await writeFile(cardPath, candidate.input.cardBytes);
+      await writeFile(join(this.cwd, "README.md"), candidate.input.readmeBytes);
+      // Candidate facts are committed metadata, never a public tree artifact.
+      await git(
+        this.runner,
+        this.cwd,
+        "rm",
+        "--ignore-unmatch",
+        "--",
+        legacyCandidateManifestPath,
+      );
+      await git(
+        this.runner,
+        this.cwd,
+        "add",
+        "--",
+        candidate.input.cardPath,
+        "README.md",
+      );
+      if (await git(this.runner, this.cwd, "status", "--short")) {
+        await git(
+          this.runner,
+          this.cwd,
+          "commit",
+          "--message",
+          "Build candidate Card",
+          "--message",
+          candidateCommitTrailers(candidate, current),
+        );
+        try {
+          await git(
+            this.runner,
+            this.cwd,
+            "push",
+            "--force-with-lease",
+            this.remote,
+            `${this.branch}:${this.branch}`,
+          );
+        } catch {
+          const readback = await this.readWorkspace().catch(() => undefined);
+          if (readback?.value && candidateMatches(readback.value, candidate))
+            return { kind: "alreadyApplied", value: readback.value };
+          return { kind: "retryableTransport" };
+        }
+      }
+      const head = oid(await git(this.runner, this.cwd, "rev-parse", "HEAD"));
+      const cardBlob = oid(
+        await git(
+          this.runner,
+          this.cwd,
+          "rev-parse",
+          `HEAD:${candidate.input.cardPath}`,
+        ),
+      );
+      const readmeBlob = oid(
+        await git(this.runner, this.cwd, "rev-parse", "HEAD:README.md"),
+      );
+      const managedCard =
+        candidate.postconditions.managedCard ??
+        candidate.postconditions.cardManifest;
+      if (!managedCard)
+        return { kind: "policyPostcondition", detail: "missing managed Card" };
+      const manifest: CardManifest = { ...managedCard, blobOid: cardBlob };
+      if (
+        manifest.path !== candidate.postconditions.cardManifest.path ||
+        manifest.blobOid !== candidate.postconditions.cardManifest.blobOid ||
+        manifest.githubId !== candidate.postconditions.cardManifest.githubId ||
+        manifest.sourcePrNumber !==
+          candidate.postconditions.cardManifest.sourcePrNumber ||
+        readmeBlob !== candidate.postconditions.readmeBlobOid
+      )
+        return {
+          kind: "policyPostcondition",
+          detail: "blob or manifest mismatch",
+        };
+      const retainedCommitOids = (
+        await git(this.runner, this.cwd, "rev-list", "HEAD")
+      )
+        .split("\n")
+        .filter(Boolean)
+        .map(oid);
+      if (
+        !candidate.postconditions.history.retainCommitOids.every((commit) =>
+          retainedCommitOids.includes(commit),
+        )
+      )
+        return {
+          kind: "policyPostcondition",
+          detail: "retained history mismatch",
+        };
+      const requiredParentOids = (
+        await git(
+          this.runner,
+          this.cwd,
+          "rev-list",
+          "--parents",
+          "-n",
+          "1",
+          "HEAD",
+        )
+      )
+        .split(" ")
+        .slice(1)
+        .map(oid);
+      if (
+        !candidate.postconditions.history.requiredParentOids.every((parent) =>
+          requiredParentOids.includes(parent),
+        )
+      )
+        return {
+          kind: "policyPostcondition",
+          detail: "immediate parent mismatch",
+        };
+      const readback: WorkspaceReadback = {
+        status: "ready",
+        integrationHeadOid: head,
+        candidate: {
+          observedOid: head,
+          provenance: "observed",
+          integrationHeadOid: head,
+          mainOid: candidate.input.observedMainOid,
+          cardPath: manifest.path,
+          cardBlobOid: cardBlob,
+          readmeBlobOid: readmeBlob,
+          readmeBytes: candidate.input.readmeBytes,
+          retainedCommitOids,
+          requiredParentOids,
+        },
+        readmeBlobOid: readmeBlob,
+        retainedCommitOids,
+      };
+      return { kind: "succeeded", value: readback };
+    } catch {
+      return { kind: "unknownOutcome" };
+    }
+  }
+
+  async readFinalMainPostconditions(
+    expected: FinalMainPostconditions,
+    context?: { signal: AbortSignal },
+  ): Promise<{
+    status: "ready";
+    value: FinalMainPostconditions;
+  }> {
+    this.activeSignal = context?.signal;
+    await git(this.runner, this.cwd, "fetch", this.remote, "main");
+    const mainOid = oid(
+      await git(this.runner, this.cwd, "rev-parse", "origin/main"),
+    );
+    const cardBlobOid = oid(
+      await git(
+        this.runner,
+        this.cwd,
+        "rev-parse",
+        `origin/main:${expected.cardManifest.path}`,
+      ),
+    );
+    const cardBytes = new TextEncoder().encode(
+      (
+        await this.runner.run(
+          ["show", `origin/main:${expected.cardManifest.path}`],
+          { cwd: this.cwd },
+        )
+      ).stdout,
+    );
+    const readmeBytes = new TextEncoder().encode(
+      (
+        await this.runner.run(["show", "origin/main:README.md"], {
+          cwd: this.cwd,
+        })
+      ).stdout,
+    );
+    const retainedCommitOids = (
+      await git(this.runner, this.cwd, "rev-list", "origin/main")
+    )
+      .split("\n")
+      .filter(Boolean)
+      .map(oid);
+    const requiredParentOids = (
+      await git(
+        this.runner,
+        this.cwd,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        "origin/main",
+      )
+    )
+      .split(" ")
+      .slice(1)
+      .map(oid);
+    const parentsOf = async (commit: Oid | undefined) =>
+      commit
+        ? (
+            await git(
+              this.runner,
+              this.cwd,
+              "rev-list",
+              "--parents",
+              "-n",
+              "1",
+              commit,
+            )
+          )
+            .split(" ")
+            .slice(1)
+            .filter(Boolean)
+            .map(oid)
+        : undefined;
+    const contributionMergeParentOids = await parentsOf(
+      expected.sourceMergeCommitOid,
+    );
+    const integrationMergeParentOids = await parentsOf(
+      expected.integrationMergeCommitOid,
+    );
+    return {
+      status: "ready",
+      value: {
+        mainOid,
+        cardManifest: { ...expected.cardManifest, blobOid: cardBlobOid },
+        cardBytes,
+        readmeBytes,
+        retainedCommitOids,
+        requiredParentOids,
+        ...(expected.sourceMergeCommitOid
+          ? { sourceMergeCommitOid: expected.sourceMergeCommitOid }
+          : {}),
+        ...(expected.integrationMergeCommitOid
+          ? { integrationMergeCommitOid: expected.integrationMergeCommitOid }
+          : {}),
+        ...(expected.contributionMergeParentOids
+          ? contributionMergeParentOids
+            ? { contributionMergeParentOids }
+            : {}
+          : {}),
+        ...(expected.integrationMergeParentOids
+          ? integrationMergeParentOids
+            ? { integrationMergeParentOids }
+            : {}
+          : {}),
+      },
+    };
+  }
+
+  async mergeNoFastForward(input: {
+    sourceRef: string;
+    expectedTargetOid: Oid;
+    message: string;
+  }): Promise<{ mergeCommitOid: Oid; parents: readonly Oid[] }> {
+    const sourceRemote = input.sourceRef.split("/", 1)[0];
+    if (sourceRemote && input.sourceRef.includes("/")) {
+      await git(
+        this.runner,
+        this.cwd,
+        "fetch",
+        sourceRemote,
+        input.sourceRef.slice(sourceRemote.length + 1),
+      );
+    }
+    const target = oid(await git(this.runner, this.cwd, "rev-parse", "HEAD"));
+    if (target !== input.expectedTargetOid)
+      throw new Error("stale merge target");
+    await git(
+      this.runner,
+      this.cwd,
+      "merge",
+      "--no-ff",
+      "--no-edit",
+      input.sourceRef,
+      "--message",
+      input.message,
+    );
+    const mergeCommitOid = oid(
+      await git(this.runner, this.cwd, "rev-parse", "HEAD"),
+    );
+    const parents = (
+      await git(
+        this.runner,
+        this.cwd,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        "HEAD",
+      )
+    )
+      .split(" ")
+      .slice(1)
+      .map(oid);
+    if (parents.length !== 2)
+      throw new Error("expected a two-parent no-ff merge");
+    await git(
+      this.runner,
+      this.cwd,
+      "push",
+      "--force-with-lease",
+      this.remote,
+      `${this.branch}:${this.branch}`,
+    );
+    return { mergeCommitOid, parents };
+  }
+}
+
+function oidFromBytes(bytes: Uint8Array): Oid {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`);
+  return oid(createHash("sha1").update(header).update(bytes).digest("hex"));
+}
+
+async function candidateFromCommit(
+  runner: GitRunner,
+  cwd: string,
+  head: Oid,
+  readmeBlobOid: Oid,
+  retainedCommitOids: readonly Oid[],
+  requiredParentOids: readonly Oid[],
+  mainOid?: Oid,
+) {
+  type CandidateTrailers = {
+    mainOid: Oid;
+    cardManifest: CardManifest;
+    readmeBlobOid: Oid;
+    history: {
+      retainCommitOids: readonly Oid[];
+      requiredParentOids: readonly Oid[];
+    };
+  };
+  let trailers: CandidateTrailers;
+  try {
+    trailers = parseCandidateTrailers(
+      (await runner.run(["cat-file", "-p", head], { cwd })).stdout,
+    );
+  } catch {
+    return undefined;
+  }
+  const cardBlobOid = oid(
+    await git(
+      runner,
+      cwd,
+      "rev-parse",
+      `${head}:${trailers.cardManifest.path}`,
+    ),
+  );
+  if (
+    cardBlobOid !== trailers.cardManifest.blobOid ||
+    readmeBlobOid !== trailers.readmeBlobOid ||
+    !trailers.history.retainCommitOids.every((commit) =>
+      retainedCommitOids.includes(commit),
+    ) ||
+    !trailers.history.requiredParentOids.every((parent) =>
+      requiredParentOids.includes(parent),
+    )
+  )
+    return undefined;
+  const readmeBytes = new TextEncoder().encode(
+    (await runner.run(["show", `${head}:README.md`], { cwd })).stdout,
+  );
+  return {
+    observedOid: head,
+    provenance: "observed" as const,
+    integrationHeadOid: head,
+    mainOid: trailers.mainOid ?? mainOid,
+    cardPath: trailers.cardManifest.path,
+    cardBlobOid,
+    readmeBlobOid,
+    readmeBytes,
+    retainedCommitOids,
+    requiredParentOids,
+  };
+}
+
+function candidateCommitTrailers(
+  candidate: CandidateWrite,
+  parent: Oid,
+): string {
+  const { cardManifest, readmeBlobOid, history } = candidate.postconditions;
+  return [
+    `Hello-From-Main-Main-Oid: ${candidate.input.observedMainOid}`,
+    `Hello-From-Main-Card-Path: ${cardManifest.path}`,
+    `Hello-From-Main-Card-Blob-Oid: ${cardManifest.blobOid}`,
+    `Hello-From-Main-GitHub-Id: ${cardManifest.githubId}`,
+    `Hello-From-Main-Source-Pr: ${cardManifest.sourcePrNumber}`,
+    `Hello-From-Main-Readme-Blob-Oid: ${readmeBlobOid}`,
+    `Hello-From-Main-Retain-Commit-Oids: ${history.retainCommitOids.join(",")}`,
+    `Hello-From-Main-Required-Parent-Oids: ${[parent].join(",")}`,
+  ].join("\n");
+}
+
+function parseCandidateTrailers(commit: string): {
+  mainOid: Oid;
+  cardManifest: CardManifest;
+  readmeBlobOid: Oid;
+  history: {
+    retainCommitOids: readonly Oid[];
+    requiredParentOids: readonly Oid[];
+  };
+} {
+  const trailers = new Map<string, string>();
+  for (const line of commit.split("\n")) {
+    const match = /^(Hello-From-Main-[A-Za-z-]+): (.+)$/.exec(line);
+    if (match?.[1] && match[2]) trailers.set(match[1], match[2]);
+  }
+  const value = (name: string) => {
+    const trailer = trailers.get(name);
+    if (!trailer) throw new Error(`missing candidate trailer: ${name}`);
+    return trailer;
+  };
+  const oidList = (name: string) =>
+    value(name).split(",").filter(Boolean).map(oid);
+  const sourcePrNumber = Number(value("Hello-From-Main-Source-Pr"));
+  if (!Number.isSafeInteger(sourcePrNumber) || sourcePrNumber < 1)
+    throw new Error("invalid candidate source PR trailer");
+  return {
+    mainOid: oid(value("Hello-From-Main-Main-Oid")),
+    cardManifest: {
+      path: value("Hello-From-Main-Card-Path"),
+      blobOid: oid(value("Hello-From-Main-Card-Blob-Oid")),
+      githubId: value("Hello-From-Main-GitHub-Id"),
+      sourcePrNumber,
+    },
+    readmeBlobOid: oid(value("Hello-From-Main-Readme-Blob-Oid")),
+    history: {
+      retainCommitOids: oidList("Hello-From-Main-Retain-Commit-Oids"),
+      requiredParentOids: oidList("Hello-From-Main-Required-Parent-Oids"),
+    },
+  };
+}
+
+function candidateMatches(
+  readback: WorkspaceReadback,
+  candidate: CandidateWrite,
+): boolean {
+  const actual = readback.candidate;
+  return (
+    actual?.cardPath === candidate.postconditions.cardManifest.path &&
+    actual.cardBlobOid === candidate.postconditions.cardManifest.blobOid &&
+    actual.readmeBlobOid === candidate.postconditions.readmeBlobOid &&
+    candidate.postconditions.history.retainCommitOids.every((commit) =>
+      readback.retainedCommitOids?.includes(commit),
+    ) &&
+    candidate.postconditions.history.requiredParentOids.every((parent) =>
+      actual.requiredParentOids?.includes(parent),
+    )
+  );
+}
+
+async function isAncestor(
+  runner: GitRunner,
+  cwd: string,
+  ancestor: Oid,
+  descendant: Oid,
+): Promise<boolean> {
+  try {
+    await runner.run(["merge-base", "--is-ancestor", ancestor, descendant], {
+      cwd,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof GitCommandError && error.result.status === 1)
+      return false;
+    throw error;
+  }
+}
+
+export async function createGitSandbox(): Promise<{
+  root: string;
+  runner: GitRunner;
+  dispose: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "hello-from-main-"));
+  return {
+    root,
+    runner: createGitRunner({ root }),
+    dispose: () => rm(root, { recursive: true, force: true }),
+  };
+}
