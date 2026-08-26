@@ -504,7 +504,11 @@ export type ContributionMergeResult =
 
 export type IntegrationMergeResult =
   | { kind: "integrationMerged"; mainOid: Oid }
-  | { kind: "integrationAlreadyApplied"; mainOid: Oid }
+  | {
+      kind: "integrationAlreadyApplied";
+      mainOid: Oid;
+      publicationEstablishedByCurrentOperation?: true;
+    }
   | {
       kind: "integrationRejected";
       reason:

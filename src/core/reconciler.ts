@@ -952,7 +952,7 @@ async function executeEffect(
   if (merge.kind === "integrationRejected") return mergeOutcome(merge);
   // Git establishes publication; a fresh provider observation establishes the
   // requested PR's merged lifecycle before completion can be emitted.
-  return { kind: "awaitingExternalFact", reason: "pending" };
+  return undefined;
 }
 
 function isReconcileOutcome(

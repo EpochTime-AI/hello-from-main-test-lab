@@ -439,6 +439,194 @@ describe("OctokitGithubPlatform", () => {
     expect(posts).toBe(1);
   });
 
+  test("records only this instance's exact Integration publication for two completion creates", async () => {
+    const facts = sourceCommentFacts();
+    facts.integrationPullRequest = {
+      status: "ready",
+      value: {
+        number: 8,
+        kind: "integration",
+        headOid: oid("candidate"),
+        baseOid: oid("main"),
+        draft: false,
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    const sourceKey = "run=source:7:42;target=7;slot=source-status";
+    const integrationKey = "run=source:7:42;target=8;slot=integration-status";
+    const completion = (
+      targetPullRequestNumber: number,
+      slot: "source-status" | "integration-status",
+      actionKey: string,
+    ): CommentIntent => ({
+      targetPullRequestNumber,
+      slot,
+      actionKey,
+      phase: "completion",
+      body: `<!-- hello-from-main: key=${encodeURIComponent(actionKey)} phase=completion -->\ncomplete\n`,
+    });
+    let posts = 0;
+    const created = new Map<number, { id: number; body: string }>();
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: facts,
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET") {
+            if (/\/issues\/comments\/12[34]$/u.test(request.path)) {
+              const target = request.path.endsWith("/124") ? 8 : 7;
+              const comment = created.get(target);
+              if (!comment) throw new Error("comment read before create");
+              return {
+                status: 200,
+                data: {
+                  ...commentTestRecord(comment.body),
+                  id: comment.id,
+                  issue_url:
+                    target === 8
+                      ? "https://api.github.com/repos/acme/hello/issues/8"
+                      : "https://api.github.com/repos/acme/hello/issues/7",
+                },
+              };
+            }
+            return { status: 200, data: [] };
+          }
+          posts += 1;
+          const target = request.path.includes("/issues/8/") ? 8 : 7;
+          const body = String(request.parameters?.body ?? "");
+          const id = target === 8 ? 124 : 123;
+          created.set(target, { id, body });
+          return {
+            status: 201,
+            data: {
+              ...commentTestRecord(body),
+              id,
+              issue_url:
+                target === 8
+                  ? "https://api.github.com/repos/acme/hello/issues/8"
+                  : "https://api.github.com/repos/acme/hello/issues/7",
+            },
+          };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    const source = completion(7, "source-status", sourceKey);
+    const integration = completion(8, "integration-status", integrationKey);
+    await expect(platform.ensureComment(source)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    platform.recordIntegrationPublication(
+      {
+        kind: "integration",
+        pullRequestNumber: 999,
+        expectedHeadOid: oid("candidate"),
+        observedBaseOid: oid("main"),
+        baseCurrentGate: "required",
+      },
+      { kind: "integrationMerged", mainOid: oid("merged") },
+    );
+    await expect(platform.ensureComment(source)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    platform.recordIntegrationPublication(
+      {
+        kind: "integration",
+        pullRequestNumber: 8,
+        expectedHeadOid: oid("candidate"),
+        observedBaseOid: oid("main"),
+        baseCurrentGate: "required",
+      },
+      { kind: "integrationAlreadyApplied", mainOid: oid("merged") },
+    );
+    await expect(platform.ensureComment(source)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    platform.recordIntegrationPublication(
+      {
+        kind: "integration",
+        pullRequestNumber: 8,
+        expectedHeadOid: oid("candidate"),
+        observedBaseOid: oid("main"),
+        baseCurrentGate: "required",
+      },
+      {
+        kind: "integrationAlreadyApplied",
+        mainOid: oid("merged"),
+        publicationEstablishedByCurrentOperation: true,
+      },
+    );
+    await expect(platform.ensureComment(source)).resolves.toMatchObject({
+      kind: "created",
+    });
+    await expect(platform.ensureComment(integration)).resolves.toMatchObject({
+      kind: "created",
+    });
+    await expect(platform.ensureComment(source)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    expect(posts).toBe(2);
+  });
+
+  test("consumes a completion permit when its actual create POST is denied", async () => {
+    const facts = sourceCommentFacts();
+    facts.integrationPullRequest = {
+      status: "ready",
+      value: {
+        number: 8,
+        kind: "integration",
+        headOid: oid("candidate"),
+        baseOid: oid("main"),
+        draft: false,
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    const key = "run=source:7:42;target=7;slot=source-status";
+    const intent: CommentIntent = {
+      targetPullRequestNumber: 7,
+      slot: "source-status",
+      actionKey: key,
+      phase: "completion",
+      body: `<!-- hello-from-main: key=${encodeURIComponent(key)} phase=completion -->\ncomplete\n`,
+    };
+    let posts = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: facts,
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET") return { status: 200, data: [] };
+          posts += 1;
+          return { status: 403, data: { message: "Resource not accessible" } };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    platform.recordIntegrationPublication(
+      {
+        kind: "integration",
+        pullRequestNumber: 8,
+        expectedHeadOid: oid("candidate"),
+        observedBaseOid: oid("main"),
+        baseCurrentGate: "required",
+      },
+      { kind: "integrationMerged", mainOid: oid("merged") },
+    );
+    await expect(platform.ensureComment(intent)).resolves.toMatchObject({
+      kind: "permissionDenied",
+    });
+    await expect(platform.ensureComment(intent)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    expect(posts).toBe(1);
+  });
+
   test("atomically reserves one structured permit for concurrent create calls", async () => {
     const intent: CommentIntent = {
       ...commentTestIntent(),
@@ -4084,6 +4272,20 @@ describe("OctokitGithubPlatform", () => {
       "9007199254740991",
     );
     expect(observed.value?.activeGithubIds).toEqual(["42"]);
+  });
+
+  test("binds live observations to the configured trusted repository origin", async () => {
+    const observed = await createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      webBaseUrl: "https://github.enterprise.example",
+      transport: identityObservationTransport("7", "42"),
+    }).observeRepository();
+    expect(observed.value?.trustedRepository).toEqual({
+      webBaseUrl: "https://github.enterprise.example",
+      owner: "acme",
+      repo: "hello",
+    });
   });
 
   test("fails closed for unsafe numeric source and active identities", async () => {

@@ -24,6 +24,7 @@ describe("production integration runtime configuration", () => {
       sourceLogin: "alice",
       commentOwner: { actorId: "42", actorType: "Bot" },
       apiOrigin: "https://api.github.com",
+      webBaseUrl: "https://github.com",
     });
   });
 
@@ -105,6 +106,7 @@ describe("production integration runtime configuration", () => {
       }),
     ).toMatchObject({
       apiOrigin: "https://github.enterprise.example/api/v3",
+      webBaseUrl: "https://github.enterprise.example",
       commentOwner: { actorId: "42", actorType: "Bot" },
     });
     expect(() =>
@@ -127,6 +129,49 @@ describe("production integration runtime configuration", () => {
         },
       }),
     ).toThrow("coherent");
+  });
+
+  test("rejects untrusted public and GHES origin shapes before composition", () => {
+    const base = {
+      defaultBranch: "main",
+      context: { sourcePullRequest: { number: 42, authorLogin: "alice" } },
+    };
+    for (const env of [
+      {
+        GITHUB_API_URL: "http://github.enterprise.example/api/v3",
+        GITHUB_SERVER_URL: "http://github.enterprise.example",
+      },
+      {
+        GITHUB_API_URL: "https://user@githu b.enterprise.example/api/v3",
+        GITHUB_SERVER_URL: "https://github.enterprise.example",
+      },
+      {
+        GITHUB_API_URL: "https://github.enterprise.example/api/v3",
+        GITHUB_SERVER_URL: "https://github.enterprise.example/root",
+      },
+      {
+        GITHUB_API_URL: "https://github.enterprise.example/not-github",
+        GITHUB_SERVER_URL: "https://github.enterprise.example",
+      },
+      {
+        GITHUB_API_URL: "https://github.enterprise.example/api/v3?x=1",
+        GITHUB_SERVER_URL: "https://github.enterprise.example",
+      },
+      {
+        GITHUB_API_URL: "https://github.com/api/v3",
+        GITHUB_SERVER_URL: "https://github.com",
+      },
+    ])
+      expect(() =>
+        deriveIntegrationRuntimeConfig({
+          ...base,
+          env: {
+            ...env,
+            HELLO_FROM_MAIN_COMMENT_OWNER_ID: "42",
+            HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: "Bot",
+          },
+        }),
+      ).toThrow("trusted GitHub");
   });
 
   test("sends no-cache only when the adapter requests a fresh comment read", async () => {

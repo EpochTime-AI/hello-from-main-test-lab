@@ -61,8 +61,15 @@ type CommentCreatePermit = {
   runIdentity: string;
   targetPullRequestNumber: number;
   slot: "source-status" | "integration-status";
-  phase: "setup" | "ready-guidance";
-  milestone: "setup" | "ready";
+  phase: "setup" | "ready-guidance" | "completion";
+  milestone: "setup" | "ready" | "publication";
+};
+
+export type OctokitIntegrationPublicationRecorder = {
+  recordIntegrationPublication(
+    request: IntegrationMergeRequest,
+    result: IntegrationMergeResult,
+  ): void;
 };
 
 export type OctokitGithubPlatformOptions = {
@@ -75,6 +82,7 @@ export type OctokitGithubPlatformOptions = {
   pullRequestNodeIds?: ReadonlyMap<number, string>;
   expectedCommentOwner?: TrustedPrincipal;
   apiOrigin?: string;
+  webBaseUrl?: string;
   repositoryId?: number;
   commentReadback?: {
     attempts?: number;
@@ -108,10 +116,11 @@ export class OctokitOperationError extends Error {
 
 export function createOctokitGithubPlatform(
   options: OctokitGithubPlatformOptions,
-): GithubPlatform {
+): GithubPlatform & OctokitIntegrationPublicationRecorder {
   let lastFacts = options.initialFacts;
   let activeSignal: AbortSignal | undefined;
   const apiOrigin = normalizeApiOrigin(options.apiOrigin);
+  const webBaseUrl = options.webBaseUrl;
   const repositoryId = options.repositoryId;
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = new Set<string>();
@@ -302,6 +311,15 @@ export function createOctokitGithubPlatform(
               trustedCommentOwner: options.expectedCommentOwner,
             }
           : {}),
+        ...(webBaseUrl
+          ? {
+              trustedRepository: {
+                webBaseUrl,
+                owner: options.owner,
+                repo: options.repo,
+              },
+            }
+          : {}),
         publishedGithubIds: mainProjection.cardManifests.map(
           (card) => card.githubId,
         ),
@@ -359,6 +377,42 @@ export function createOctokitGithubPlatform(
 
   const platform = {
     observeRepository,
+    recordIntegrationPublication(
+      request: IntegrationMergeRequest,
+      result: IntegrationMergeResult,
+    ): void {
+      if (
+        result.kind !== "integrationMerged" &&
+        !(
+          result.kind === "integrationAlreadyApplied" &&
+          result.publicationEstablishedByCurrentOperation
+        )
+      )
+        return;
+      const facts = lastFacts ?? options.initialFacts;
+      const source = facts?.sourcePullRequest.value;
+      const integration = facts?.integrationPullRequest.value;
+      if (
+        !source?.authorGithubId ||
+        !integration ||
+        integration.number !== request.pullRequestNumber ||
+        integration.headOid !== request.expectedHeadOid ||
+        integration.baseOid !== request.observedBaseOid
+      )
+        return;
+      grantCommentCreatePermit({
+        targetPullRequestNumber: source.number,
+        slot: "source-status",
+        phase: "completion",
+        milestone: "publication",
+      });
+      grantCommentCreatePermit({
+        targetPullRequestNumber: integration.number,
+        slot: "integration-status",
+        phase: "completion",
+        milestone: "publication",
+      });
+    },
     async createIntegrationBranch(
       input: {
         name: string;
@@ -732,7 +786,7 @@ export function createOctokitGithubPlatform(
       }
     },
   };
-  return platform as GithubPlatform;
+  return platform as GithubPlatform & OctokitIntegrationPublicationRecorder;
 
   async function mergeRequest(
     number: number,
@@ -1572,8 +1626,8 @@ export function createOctokitGithubPlatform(
   function grantCommentCreatePermit(input: {
     targetPullRequestNumber: number;
     slot: "source-status" | "integration-status";
-    phase: "setup" | "ready-guidance";
-    milestone: "setup" | "ready";
+    phase: "setup" | "ready-guidance" | "completion";
+    milestone: "setup" | "ready" | "publication";
   }): void {
     const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
     if (!source?.authorGithubId) return;
@@ -1584,7 +1638,6 @@ export function createOctokitGithubPlatform(
   }
 
   function reserveCommentCreatePermit(intent: CommentIntent): boolean {
-    if (intent.phase === "completion") return false;
     const key = parseCommentActionKey(intent.actionKey);
     const index = commentCreatePermits.findIndex(
       (permit) =>
@@ -1690,9 +1743,10 @@ export function createOctokitGithubPlatform(
 
 function milestoneForCommentPhase(
   phase: CommentIntent["phase"],
-): "setup" | "ready" | undefined {
+): "setup" | "ready" | "publication" | undefined {
   if (phase === "setup") return "setup";
   if (phase === "ready-guidance") return "ready";
+  if (phase === "completion") return "publication";
   return undefined;
 }
 

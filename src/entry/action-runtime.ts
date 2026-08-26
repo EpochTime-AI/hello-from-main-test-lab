@@ -136,6 +136,7 @@ async function runProductionComposition(input: {
           repo,
           transport,
           ...(runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {}),
+          ...(runtime.webBaseUrl ? { webBaseUrl: runtime.webBaseUrl } : {}),
           repositoryId,
           expectedCommentOwner: runtime.commentOwner,
         }),
@@ -215,6 +216,7 @@ export type IntegrationRuntimeConfig = {
   sourceLogin: string;
   commentOwner: TrustedPrincipal;
   apiOrigin?: string;
+  webBaseUrl?: string;
 };
 
 export function deriveIntegrationRuntimeConfig(input: {
@@ -268,21 +270,26 @@ export function deriveIntegrationRuntimeConfig(input: {
     sourceLogin: login,
     commentOwner,
     apiOrigin: runtimeIdentity.apiOrigin,
+    webBaseUrl: runtimeIdentity.webBaseUrl,
   };
 }
 
 function resolveRuntimeIdentity(env: NodeJS.ProcessEnv): {
   apiOrigin: string;
+  webBaseUrl: string;
   publicGithub: boolean;
 } {
   const standardApi = env.GITHUB_API_URL;
   const standardServer = env.GITHUB_SERVER_URL;
   const custom = env.HELLO_FROM_MAIN_API_ORIGIN;
-  const customOrigin = custom ? normalizeOrigin(custom) : undefined;
-  const apiOrigin = normalizeOrigin(standardApi ?? "https://api.github.com");
-  const serverOrigin = normalizeOrigin(standardServer ?? "https://github.com");
+  const apiOrigin = trustedUrl(standardApi ?? "https://api.github.com", "API");
+  const serverOrigin = trustedUrl(
+    standardServer ?? "https://github.com",
+    "server",
+  );
   if (!trustedApiMatchesServer(apiOrigin, serverOrigin))
     throw new Error("trusted GitHub API and server origins are not coherent");
+  const customOrigin = custom ? trustedUrl(custom, "API") : undefined;
   if (customOrigin && !sameApiOrigin(customOrigin, apiOrigin))
     throw new Error(
       "custom API origin must be coherent with the trusted runtime",
@@ -291,15 +298,29 @@ function resolveRuntimeIdentity(env: NodeJS.ProcessEnv): {
   const publicGithub =
     effectiveApi === "https://api.github.com" &&
     serverOrigin === "https://github.com";
-  return { apiOrigin: effectiveApi, publicGithub };
+  return { apiOrigin: effectiveApi, webBaseUrl: serverOrigin, publicGithub };
 }
 
-function normalizeOrigin(value: string): string {
-  const url = new URL(value);
-  url.pathname = url.pathname.replace(/\/+$/u, "");
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/$/u, "");
+function trustedUrl(value: string, kind: "API" | "server"): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    (kind === "server" && url.pathname !== "/")
+  )
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  const pathname = url.pathname.replace(/\/+$/u, "") || "/";
+  if (kind === "API" && pathname !== "/" && pathname !== "/api/v3")
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  return `${url.origin}${pathname === "/" ? "" : pathname}`;
 }
 
 function sameApiOrigin(left: string, right: string): boolean {
@@ -310,10 +331,14 @@ function trustedApiMatchesServer(
   apiOrigin: string,
   serverOrigin: string,
 ): boolean {
+  if (serverOrigin === "https://github.com")
+    return apiOrigin === "https://api.github.com";
   return (
     (apiOrigin === "https://api.github.com" &&
       serverOrigin === "https://github.com") ||
-    new URL(apiOrigin).origin === serverOrigin
+    (new URL(apiOrigin).origin === serverOrigin &&
+      (new URL(apiOrigin).pathname === "/api/v3" ||
+        new URL(apiOrigin).pathname === ""))
   );
 }
 
@@ -334,8 +359,21 @@ export function bindProductionSetup(
     request: ContributionMergeRequest | IntegrationMergeRequest,
     context?: InvocationContext,
   ): Promise<ContributionMergeResult | IntegrationMergeResult> {
-    if (request.kind === "integration")
-      return workspace.publishIntegrationMerge(request, context);
+    if (request.kind === "integration") {
+      const result = await workspace.publishIntegrationMerge(request, context);
+      if (
+        result.kind === "integrationMerged" ||
+        (result.kind === "integrationAlreadyApplied" &&
+          result.publicationEstablishedByCurrentOperation)
+      )
+        (
+          github as GithubPlatform &
+            Partial<
+              import("../adapters/octokit.js").OctokitIntegrationPublicationRecorder
+            >
+        ).recordIntegrationPublication?.(request, result);
+      return result;
+    }
     return github.mergePullRequest(request, context);
   }
   return {

@@ -107,7 +107,7 @@ __export(git_exports, {
   installGitAuthentication: () => installGitAuthentication
 });
 import { spawn } from "node:child_process";
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash2, randomUUID } from "node:crypto";
 import {
   chmod,
   mkdir,
@@ -1071,13 +1071,16 @@ var init_git = __esm({
           if (observedCandidateOid !== request.expectedHeadOid)
             return { kind: "integrationRejected", reason: "stalePrecondition" };
           await git(this.runner, this.cwd, "switch", "-C", "main", observedMain);
+          const publicationIdentity = randomUUID();
           try {
             await git(
               this.runner,
               this.cwd,
               "merge",
               "--no-ff",
-              "--no-edit",
+              `--message=Publish Integration
+
+Hello-From-Main-Publication: ${publicationIdentity}`,
               observedCandidateOid
             );
           } catch (error) {
@@ -1121,7 +1124,11 @@ var init_git = __esm({
               expectedTreeOid
             );
             if (readback2.kind === "applied")
-              return { kind: "integrationAlreadyApplied", mainOid: readback2.oid };
+              return {
+                kind: "integrationAlreadyApplied",
+                mainOid: readback2.oid,
+                ...readback2.oid === proposedMergeOid ? { publicationEstablishedByCurrentOperation: true } : {}
+              };
             const readbackReason = integrationReadbackRejectionReason(readback2);
             return {
               kind: "integrationRejected",
@@ -1277,6 +1284,7 @@ function createOctokitGithubPlatform(options) {
   let lastFacts = options.initialFacts;
   let activeSignal;
   const apiOrigin = normalizeApiOrigin(options.apiOrigin);
+  const webBaseUrl = options.webBaseUrl;
   const repositoryId = options.repositoryId;
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = /* @__PURE__ */ new Set();
@@ -1392,6 +1400,13 @@ function createOctokitGithubPlatform(options) {
           ]),
           trustedCommentOwner: options.expectedCommentOwner
         } : {},
+        ...webBaseUrl ? {
+          trustedRepository: {
+            webBaseUrl,
+            owner: options.owner,
+            repo: options.repo
+          }
+        } : {},
         publishedGithubIds: mainProjection.cardManifests.map(
           (card) => card.githubId
         ),
@@ -1431,6 +1446,27 @@ function createOctokitGithubPlatform(options) {
   };
   const platform = {
     observeRepository,
+    recordIntegrationPublication(request, result) {
+      if (result.kind !== "integrationMerged" && !(result.kind === "integrationAlreadyApplied" && result.publicationEstablishedByCurrentOperation))
+        return;
+      const facts = lastFacts ?? options.initialFacts;
+      const source = facts?.sourcePullRequest.value;
+      const integration = facts?.integrationPullRequest.value;
+      if (!source?.authorGithubId || !integration || integration.number !== request.pullRequestNumber || integration.headOid !== request.expectedHeadOid || integration.baseOid !== request.observedBaseOid)
+        return;
+      grantCommentCreatePermit({
+        targetPullRequestNumber: source.number,
+        slot: "source-status",
+        phase: "completion",
+        milestone: "publication"
+      });
+      grantCommentCreatePermit({
+        targetPullRequestNumber: integration.number,
+        slot: "integration-status",
+        phase: "completion",
+        milestone: "publication"
+      });
+    },
     async createIntegrationBranch(input, context) {
       activeSignal = context?.signal;
       let response;
@@ -2420,7 +2456,6 @@ function createOctokitGithubPlatform(options) {
     });
   }
   function reserveCommentCreatePermit(intent) {
-    if (intent.phase === "completion") return false;
     const key2 = parseCommentActionKey(intent.actionKey);
     const index = commentCreatePermits.findIndex(
       (permit) => key2 !== void 0 && key2.runIdentity === permit.runIdentity && key2.targetPullRequestNumber === permit.targetPullRequestNumber && key2.slot === permit.slot && intent.targetPullRequestNumber === permit.targetPullRequestNumber && intent.slot === permit.slot && intent.phase === permit.phase && milestoneForCommentPhase(intent.phase) === permit.milestone
@@ -2499,6 +2534,7 @@ function createOctokitGithubPlatform(options) {
 function milestoneForCommentPhase(phase) {
   if (phase === "setup") return "setup";
   if (phase === "ready-guidance") return "ready";
+  if (phase === "completion") return "publication";
   return void 0;
 }
 var COMMENT_PAGE_BUDGET = 8;
@@ -3905,7 +3941,7 @@ async function executeEffect(effect, dependencies, budget) {
     (context) => dependencies.github.mergePullRequest(effect.request, context)
   );
   if (merge.kind === "integrationRejected") return mergeOutcome(merge);
-  return { kind: "awaitingExternalFact", reason: "pending" };
+  return void 0;
 }
 function isReconcileOutcome(value) {
   return value.kind === "quiescent" || value.kind === "awaitingExternalFact" || value.kind === "retryable" || value.kind === "budgetExhausted" || value.kind === "terminal";
@@ -4345,6 +4381,7 @@ async function runProductionComposition(input) {
           repo,
           transport,
           ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
+          ...runtime.webBaseUrl ? { webBaseUrl: runtime.webBaseUrl } : {},
           repositoryId,
           expectedCommentOwner: runtime.commentOwner
         }),
@@ -4432,43 +4469,60 @@ function deriveIntegrationRuntimeConfig(input) {
     sourcePullRequestNumber: number,
     sourceLogin: login,
     commentOwner,
-    apiOrigin: runtimeIdentity.apiOrigin
+    apiOrigin: runtimeIdentity.apiOrigin,
+    webBaseUrl: runtimeIdentity.webBaseUrl
   };
 }
 function resolveRuntimeIdentity(env) {
   const standardApi = env.GITHUB_API_URL;
   const standardServer = env.GITHUB_SERVER_URL;
   const custom = env.HELLO_FROM_MAIN_API_ORIGIN;
-  const customOrigin = custom ? normalizeOrigin(custom) : void 0;
-  const apiOrigin = normalizeOrigin(standardApi ?? "https://api.github.com");
-  const serverOrigin = normalizeOrigin(standardServer ?? "https://github.com");
+  const apiOrigin = trustedUrl(standardApi ?? "https://api.github.com", "API");
+  const serverOrigin = trustedUrl(
+    standardServer ?? "https://github.com",
+    "server"
+  );
   if (!trustedApiMatchesServer(apiOrigin, serverOrigin))
     throw new Error("trusted GitHub API and server origins are not coherent");
+  const customOrigin = custom ? trustedUrl(custom, "API") : void 0;
   if (customOrigin && !sameApiOrigin(customOrigin, apiOrigin))
     throw new Error(
       "custom API origin must be coherent with the trusted runtime"
     );
   const effectiveApi = customOrigin ?? apiOrigin;
   const publicGithub = effectiveApi === "https://api.github.com" && serverOrigin === "https://github.com";
-  return { apiOrigin: effectiveApi, publicGithub };
+  return { apiOrigin: effectiveApi, webBaseUrl: serverOrigin, publicGithub };
 }
-function normalizeOrigin(value) {
-  const url = new URL(value);
-  url.pathname = url.pathname.replace(/\/+$/u, "");
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/$/u, "");
+function trustedUrl(value, kind) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || kind === "server" && url.pathname !== "/")
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  const pathname = url.pathname.replace(/\/+$/u, "") || "/";
+  if (kind === "API" && pathname !== "/" && pathname !== "/api/v3")
+    throw new Error("trusted GitHub origin has an invalid URL shape");
+  return `${url.origin}${pathname === "/" ? "" : pathname}`;
 }
 function sameApiOrigin(left, right) {
   return left === right;
 }
 function trustedApiMatchesServer(apiOrigin, serverOrigin) {
-  return apiOrigin === "https://api.github.com" && serverOrigin === "https://github.com" || new URL(apiOrigin).origin === serverOrigin;
+  if (serverOrigin === "https://github.com")
+    return apiOrigin === "https://api.github.com";
+  return apiOrigin === "https://api.github.com" && serverOrigin === "https://github.com" || new URL(apiOrigin).origin === serverOrigin && (new URL(apiOrigin).pathname === "/api/v3" || new URL(apiOrigin).pathname === "");
 }
 function bindProductionSetup(github, runtime, workspace) {
   async function mergePullRequest(request, context) {
-    if (request.kind === "integration")
-      return workspace.publishIntegrationMerge(request, context);
+    if (request.kind === "integration") {
+      const result = await workspace.publishIntegrationMerge(request, context);
+      if (result.kind === "integrationMerged" || result.kind === "integrationAlreadyApplied" && result.publicationEstablishedByCurrentOperation)
+        github.recordIntegrationPublication?.(request, result);
+      return result;
+    }
     return github.mergePullRequest(request, context);
   }
   return {

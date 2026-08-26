@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   mkdir,
@@ -892,13 +892,14 @@ export class RealGitWorkspace {
       if (observedCandidateOid !== request.expectedHeadOid)
         return { kind: "integrationRejected", reason: "stalePrecondition" };
       await git(this.runner, this.cwd, "switch", "-C", "main", observedMain);
+      const publicationIdentity = randomUUID();
       try {
         await git(
           this.runner,
           this.cwd,
           "merge",
           "--no-ff",
-          "--no-edit",
+          `--message=Publish Integration\n\nHello-From-Main-Publication: ${publicationIdentity}`,
           observedCandidateOid,
         );
       } catch (error) {
@@ -944,7 +945,13 @@ export class RealGitWorkspace {
           expectedTreeOid,
         );
         if (readback.kind === "applied")
-          return { kind: "integrationAlreadyApplied", mainOid: readback.oid };
+          return {
+            kind: "integrationAlreadyApplied",
+            mainOid: readback.oid,
+            ...(readback.oid === proposedMergeOid
+              ? { publicationEstablishedByCurrentOperation: true as const }
+              : {}),
+          };
         const readbackReason = integrationReadbackRejectionReason(readback);
         return {
           kind: "integrationRejected",

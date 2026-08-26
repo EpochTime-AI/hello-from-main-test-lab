@@ -39,6 +39,7 @@ describe("runtime composition", () => {
     const contributionHead = oid("contribution-head");
     const integrationHead = oid("integration-head");
     const main = oid("main-base");
+    const recordIntegrationPublication = vi.fn();
     const octokit = {
       mergePullRequest: vi.fn(async (request) =>
         request.kind === "contribution"
@@ -48,6 +49,7 @@ describe("runtime composition", () => {
               reason: "gateUnsupported" as const,
             },
       ),
+      recordIntegrationPublication,
     } as unknown as GithubPlatform;
     const workspace = {
       publishIntegrationMerge: vi.fn(async () => ({
@@ -99,6 +101,10 @@ describe("runtime composition", () => {
         baseCurrentGate: "required",
       },
       undefined,
+    );
+    expect(recordIntegrationPublication).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "integration" }),
+      expect.objectContaining({ kind: "integrationMerged" }),
     );
   });
 

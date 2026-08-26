@@ -824,10 +824,7 @@ describe("Core comment contracts", () => {
     expect(
       publicationResult,
       JSON.stringify({ diagnostics, intents, merges }),
-    ).toEqual({
-      kind: "awaitingExternalFact",
-      reason: "pending",
-    });
+    ).toEqual({ kind: "quiescent" });
 
     const completionResult = await reconciler.reconcile({
       budget: { maxEffects: 3 },
@@ -841,6 +838,10 @@ describe("Core comment contracts", () => {
       kind: "quiescent",
     });
     expect(merges).toBe(1);
+    expect(intents).toContain(`${source.number}:source-status:completion`);
+    expect(intents).toContain(
+      `${integration.number}:integration-status:completion`,
+    );
     expect(
       comments.map((comment) => comment.targetPullRequestNumber),
     ).toContain(source.number);

@@ -1,8 +1,14 @@
 import { describe, expect, test, vi } from "vitest";
+import { createOctokitGithubPlatform } from "../../src/adapters/octokit.js";
 import { gitBlobOid, oid } from "../../src/core/model.js";
 import { createReconciler } from "../../src/core/reconciler.js";
+import { bindProductionSetup } from "../../src/entry/action-runtime.js";
 import type { GitWorkspace } from "../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../src/ports/github-platform.js";
+import {
+  renderReadyComment,
+  renderValidationComment,
+} from "../../src/render/comment.js";
 import { stabilityFacts, testCandidatePolicy } from "../fixtures/stability.js";
 
 function readyFacts() {
@@ -121,7 +127,7 @@ function markIntegrationPublished(facts: ReturnType<typeof readyFacts>) {
   const main = facts.main.value;
   const card = facts.acceptedCard;
   if (!integration || !main || !card) throw new Error("fixture is incomplete");
-  const published = oid("main-merged");
+  const published = oid("0123456789abcdef0123456789abcdef01234567");
   facts.integrationPullRequest.value = {
     ...integration,
     merged: true,
@@ -171,7 +177,7 @@ describe("L4 H2 and final publication pipeline", () => {
     expect(local.mergePullRequest).not.toHaveBeenCalled();
   });
 
-  test("awaits a fresh provider observation after Git publication", async () => {
+  test("continues to a fresh provider observation after Git publication", async () => {
     const facts = readyFacts();
     const candidate = facts.candidate.value;
     if (!candidate) throw new Error("candidate is required");
@@ -184,7 +190,7 @@ describe("L4 H2 and final publication pipeline", () => {
         git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
-    ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "pending" });
+    ).resolves.toEqual({ kind: "budgetExhausted", effects: 1 });
     expect(final).not.toHaveBeenCalled();
   });
 
@@ -200,7 +206,7 @@ describe("L4 H2 and final publication pipeline", () => {
     }));
     const final = vi.fn(async (expected) => ({
       status: "ready" as const,
-      value: expected,
+      value: { ...expected, cardBytes: facts.acceptedCard?.bytes },
     }));
 
     await expect(
@@ -208,22 +214,181 @@ describe("L4 H2 and final publication pipeline", () => {
         github: {
           ...local.github,
           observeRepository,
+          mergePullRequest: (async () => {
+            markIntegrationPublished(facts);
+            return {
+              kind: "integrationMerged" as const,
+              mainOid: oid("main-merged"),
+            };
+          }) as unknown as GithubPlatform["mergePullRequest"],
         },
         git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 2 } }),
-    ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "pending" });
-    expect(observeRepository).toHaveBeenCalledOnce();
-    expect(final).not.toHaveBeenCalled();
-    markIntegrationPublished(facts);
-    await expect(
-      createReconciler({
-        github: { ...local.github, observeRepository },
-        git: workspace({ final, candidate }),
-        candidatePolicy: testCandidatePolicy,
-      }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "quiescent" });
+    expect(observeRepository).toHaveBeenCalledTimes(2);
     expect(final).toHaveBeenCalledOnce();
+  });
+
+  test("binds concrete Octokit permits to current publication across fresh observations", async () => {
+    const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
+    facts.trustedRepository = {
+      webBaseUrl: "https://github.com",
+      owner: "acme",
+      repo: "hello",
+    };
+    const source = facts.sourcePullRequest.value;
+    const integration = facts.integrationPullRequest.value;
+    if (!source || !integration)
+      throw new Error("fixture pull requests are required");
+    const runIdentity = "source:1:7";
+    const validation = renderValidationComment({
+      runIdentity,
+      sourcePullRequestNumber: source.number,
+      sourceHeadOid: source.headOid,
+      result: { kind: "valid", headOid: source.headOid },
+    });
+    const ready = renderReadyComment({
+      runIdentity,
+      originalContributor: "alice",
+      integrationPullRequestNumber: integration.number,
+      candidateHeadOid: integration.headOid,
+      cardPath: candidate.cardPath,
+      cardBlobOid: candidate.cardBlobOid,
+    });
+    facts.comments = [validation, ready].map((comment, id) => ({
+      id: id + 10,
+      user: { id: "42", actorType: "Bot" as const },
+      ownerPrincipal: { actorId: "42", actorType: "Bot" as const },
+      actionKey: comment.actionKey,
+      body: comment.body,
+      targetPullRequestNumber:
+        comment.slot === "source-status" ? source.number : integration.number,
+    }));
+    const lifecycleComments = facts.comments;
+    const comments: Array<{
+      id: number;
+      body: string;
+      targetPullRequestNumber: number;
+    }> = [];
+    const intents: string[] = [];
+    const commentResults: string[] = [];
+    let observations = 0;
+    let posts = 0;
+    const octokit = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      replay: true,
+      initialFacts: facts,
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      webBaseUrl: "https://github.com",
+      transport: {
+        rest: async (request) => {
+          const target = Number(/issues\/(\d+)/u.exec(request.path)?.[1]);
+          if (request.method === "GET" && request.path.includes("/comments/")) {
+            const comment = comments.find((item) =>
+              request.path.endsWith(`/${item.id}`),
+            );
+            if (!comment) throw new Error("missing comment readback");
+            return {
+              status: 200,
+              data: {
+                ...comment,
+                user: { id: 42, type: "Bot" },
+                issue_url: `https://api.github.com/repos/acme/hello/issues/${comment.targetPullRequestNumber}`,
+              },
+            };
+          }
+          if (request.method === "GET") return { status: 200, data: [] };
+          posts += 1;
+          const comment = {
+            id: posts,
+            body: String(request.parameters?.body),
+            targetPullRequestNumber: target,
+          };
+          comments.push(comment);
+          return {
+            status: 201,
+            data: {
+              ...comment,
+              user: { id: 42, type: "Bot" },
+              issue_url: `https://api.github.com/repos/acme/hello/issues/${target}`,
+            },
+          };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    const github = bindProductionSetup(
+      {
+        ...octokit,
+        ensureComment: async (intent) => {
+          intents.push(
+            `${intent.targetPullRequestNumber}:${intent.slot}:${intent.phase}`,
+          );
+          const result = await octokit.ensureComment(intent);
+          commentResults.push(result.kind);
+          return result;
+        },
+        observeRepository: async () => {
+          observations += 1;
+          const observed = await octokit.observeRepository();
+          if (observed.value)
+            observed.value.comments = [
+              ...(observations === 1 ? lifecycleComments : []),
+              ...comments.map((comment) => ({
+                ...comment,
+                user: { id: "42", actorType: "Bot" as const },
+                ownerPrincipal: { actorId: "42", actorType: "Bot" as const },
+                actionKey: decodeURIComponent(
+                  /key=([^ ]+)/u.exec(comment.body)?.[1] ?? "",
+                ),
+              })),
+            ];
+          return observed;
+        },
+      },
+      {
+        remote: "origin",
+        branch: "feature/card-alice-source-1",
+        sourcePullRequestNumber: 1,
+        sourceLogin: "alice",
+        commentOwner: { actorId: "42", actorType: "Bot" },
+      },
+      {
+        publishIntegrationMerge: async () => {
+          markIntegrationPublished(facts);
+          return {
+            kind: "integrationMerged" as const,
+            mainOid: oid("main-merged"),
+          };
+        },
+      } as never,
+    );
+    const final = vi.fn(async (expected) => ({
+      status: "ready" as const,
+      value: { ...expected, cardBytes: facts.acceptedCard?.bytes },
+    }));
+    const diagnostics: unknown[] = [];
+    const outcome = await createReconciler({
+      github,
+      git: workspace({ final, candidate }),
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({
+      budget: { maxEffects: 4 },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect(
+      outcome,
+      JSON.stringify({ diagnostics, intents, commentResults }),
+    ).toEqual({
+      kind: "quiescent",
+    });
+    expect(observations).toBe(4);
+    expect(final).toHaveBeenCalledTimes(3);
+    expect(posts).toBe(2);
   });
 
   test("awaits instead of publishing when candidate history readback is missing", async () => {
@@ -257,7 +422,7 @@ describe("L4 H2 and final publication pipeline", () => {
     const final = vi.fn(async () => ({
       status: "ready" as const,
       value: {
-        mainOid: oid("main-merged"),
+        mainOid: facts.main.value?.oid ?? oid("main-merged"),
         cardManifest: {
           path: "people/alice.md",
           blobOid: oid("wrong-card"),

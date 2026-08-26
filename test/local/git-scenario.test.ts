@@ -785,6 +785,7 @@ describe("real local Git scenario", () => {
       expect(result).toEqual({
         kind: "integrationAlreadyApplied",
         mainOid: expect.any(String),
+        publicationEstablishedByCurrentOperation: true,
       });
     } finally {
       await scenario.dispose();
@@ -866,6 +867,7 @@ describe("real local Git scenario", () => {
       expect(result).toEqual({
         kind: "integrationAlreadyApplied",
         mainOid: expect.any(String),
+        publicationEstablishedByCurrentOperation: true,
       });
       if (result.kind !== "integrationAlreadyApplied")
         throw new Error("publication recovery is required");
