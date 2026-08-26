@@ -25,7 +25,7 @@ describe("trusted Action context", () => {
     ).rejects.toThrow("trusted default branch");
   });
 
-  test("accepts a PR event checked out from trusted main and preserves only passive source facts", async () => {
+  test("accepts a target PR event checked out from trusted main and preserves only passive source facts", async () => {
     const root = join(tmpdir(), `hello-action-${Date.now()}-pr`);
     await mkdir(root, { recursive: true });
     const eventPath = join(root, "event.json");
@@ -48,7 +48,7 @@ describe("trusted Action context", () => {
       createTrustedActionContext({
         env: {
           GITHUB_EVENT_PATH: eventPath,
-          GITHUB_EVENT_NAME: "pull_request",
+          GITHUB_EVENT_NAME: "pull_request_target",
           GITHUB_REPOSITORY: "acme/hello",
           GITHUB_REF: "refs/heads/main",
           HELLO_FROM_MAIN_TRUSTED_SOURCE_REF: "refs/heads/main",
@@ -87,7 +87,7 @@ describe("trusted Action context", () => {
       createTrustedActionContext({
         env: {
           GITHUB_EVENT_PATH: eventPath,
-          GITHUB_EVENT_NAME: "pull_request",
+          GITHUB_EVENT_NAME: "pull_request_target",
           GITHUB_REPOSITORY: "acme/hello",
           GITHUB_REF: "refs/heads/main",
           HELLO_FROM_MAIN_TRUSTED_SOURCE_REF: "refs/heads/main",

@@ -173,10 +173,14 @@ for (const file of files) {
   const path = join(options.workflowsDir, file);
   const source = await readFile(path, "utf8");
   parseYaml(source, path);
-  if (source.includes("pull_request_target") || source.includes("GITHUB_HEAD_REF"))
-    throw new Error(`${file} uses an untrusted PR execution boundary`);
-  if (/uses:\s+(?!\.:)[^\s]+/.test(source) && !source.includes("actions/checkout@v4"))
-    throw new Error(`${file} must not invoke third-party Actions in this offline scaffold`);
+  if (source.includes("GITHUB_HEAD_REF") || source.includes("github.event.pull_request.head"))
+    throw new Error(`${file} uses an untrusted PR head`);
+  for (const match of source.matchAll(/^\s*-?\s*uses:\s+([^\s]+)\s*$/gmu)) {
+    const action = match[1];
+    if (!action || action.startsWith("./")) continue;
+    if (!/^[^@/]+\/[^@]+@[0-9a-f]{40}$/u.test(action))
+      throw new Error(`${file} uses a mutable third-party Action reference`);
+  }
   if (!source.includes("concurrency:") || !source.includes("cancel-in-progress:"))
     throw new Error(`${file} must declare repository concurrency policy`);
   if (file === "controller.yml" || file === "watchdog.yml") {
@@ -185,7 +189,13 @@ for (const file of files) {
       "HELLO_FROM_MAIN_COMMENT_OWNER_TYPE",
     ])
       if (!source.includes(`${name}: \${{ vars.${name} || (github.server_url == 'https://github.com'`))
-        throw new Error(`${file} must wire ${name} from a repository variable`);
+         throw new Error(`${file} must wire ${name} from a repository variable`);
+  }
+  if (file === "controller.yml") {
+    if (!source.includes("pull_request_target:") || source.includes("  pull_request:\n"))
+      throw new Error("controller must use pull_request_target only");
+    if (!source.includes("repository: ${{ github.repository }}") || !source.includes("ref: refs/heads/main") || !source.includes("persist-credentials: false"))
+      throw new Error("controller must check out trusted main without persisted credentials");
   }
 }
 

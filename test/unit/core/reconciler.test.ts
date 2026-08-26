@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type {
+  CommentIntent,
   ContributionMergeRequest,
   ContributionMergeResult,
   IntegrationMergeRequest,
@@ -9,9 +10,11 @@ import { oid } from "../../../src/core/model.js";
 import {
   createReconciler,
   validateFinalMain,
+  validateIntake,
 } from "../../../src/core/reconciler.js";
 import type { GitWorkspace } from "../../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../../src/ports/github-platform.js";
+import { renderValidationComment } from "../../../src/render/comment.js";
 import {
   readyWorkspace,
   stabilityFacts,
@@ -300,6 +303,17 @@ describe("production reconciler boundary", () => {
       merged: false,
       closed: false,
     };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "ready",
+      provenance: "modeled",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: oid("integration-1"),
+        isAncestor: true,
+        observedOid: oid("integration-1"),
+        provenance: "modeled",
+      },
+    };
     let merges = 0;
     const github = {
       observeRepository: async () => ({
@@ -335,6 +349,158 @@ describe("production reconciler boundary", () => {
     });
 
     expect(merges).toBe(1);
+  });
+
+  test("blocks a retargeted source head that does not contain the Integration head", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "ready",
+      provenance: "provider",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: source.headOid,
+        isAncestor: false,
+        observedOid: source.headOid,
+        provenance: "provider",
+      },
+    };
+    let merges = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        mergePullRequest: async () => {
+          merges += 1;
+          return {
+            kind: "contributionMerged" as const,
+            headOid: oid("merged"),
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(validateIntake(facts, testCandidatePolicy)).toMatchObject({
+      kind: "invalid",
+      issues: [{ category: "integration-base-or-ancestry" }],
+    });
+    expect(merges).toBe(0);
+    expect(result).toEqual({ kind: "terminal", reason: "policyRejected" });
+  });
+
+  test("awaits an unavailable source ancestry fact before validation or merge", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "incomplete",
+      provenance: "provider",
+    };
+    let merges = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        mergePullRequest: async () => {
+          merges += 1;
+          return {
+            kind: "contributionMerged" as const,
+            headOid: oid("merged"),
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(merges).toBe(0);
+    expect(result).toEqual({
+      kind: "awaitingExternalFact",
+      reason: "incomplete",
+    });
+  });
+
+  test("updates stale validation success before planning the contribution merge", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    const oldValidation = renderValidationComment({
+      runIdentity: "source:1:7",
+      sourcePullRequestNumber: source.number,
+      sourceHeadOid: oid("old-source"),
+      result: { kind: "valid", headOid: oid("old-source") },
+    });
+    facts.comments = [
+      {
+        id: 1,
+        targetPullRequestNumber: source.number,
+        user: { id: "42", actorType: "Bot" },
+        ownerPrincipal: { actorId: "42", actorType: "Bot" },
+        actionKey: oldValidation.actionKey,
+        body: oldValidation.body,
+      },
+    ];
+    const effects: string[] = [];
+    const github = {
+      observeRepository: async () => ({
+        status: "ready" as const,
+        value: facts,
+      }),
+      ensureComment: async (intent: CommentIntent) => {
+        effects.push(`${intent.phase}:${intent.body}`);
+        facts.comments = [
+          {
+            id: 1,
+            targetPullRequestNumber: intent.targetPullRequestNumber,
+            user: { id: "42", actorType: "Bot" },
+            ownerPrincipal: { actorId: "42", actorType: "Bot" },
+            actionKey: intent.actionKey,
+            body: intent.body,
+          },
+        ];
+        return {
+          kind: "updated" as const,
+          comment: facts.comments[0],
+        };
+      },
+      mergePullRequest: async (request: ContributionMergeRequest) => {
+        effects.push(`merge:${request.expectedHeadOid}`);
+        return {
+          kind: "contributionMerged" as const,
+          headOid: oid("merged"),
+        };
+      },
+    } as unknown as GithubPlatform;
+
+    const reconciler = createReconciler({
+      github,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    });
+    await expect(
+      reconciler.reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({
+      kind: "budgetExhausted",
+      effects: 1,
+    });
+    await expect(
+      reconciler.reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({
+      kind: "budgetExhausted",
+      effects: 1,
+    });
+    expect(effects[0]).toMatch(/^validation-success:/u);
+    expect(effects[1]).toBe("merge:contribution-1");
   });
 
   test("rejects a candidate write whose readback does not satisfy its manifest postconditions", async () => {
@@ -810,6 +976,73 @@ describe("production reconciler boundary", () => {
       git: { readWorkspace: readySetupWorkspace } as unknown as GitWorkspace,
     }).reconcile({ budget: { maxEffects: 1 } });
     expect(result).toEqual({ kind: "terminal", reason: "policyRejected" });
+  });
+
+  test("plans candidate/H2 work after main drift without using an open PR synthetic merge SHA", async () => {
+    const facts = stabilityFacts();
+    const main = facts.main.value;
+    if (!main) throw new Error("main is required");
+    facts.main.value = { ...main, oid: oid("main-2") };
+    facts.integrationPullRequest = {
+      ...facts.integrationPullRequest,
+      ...(facts.integrationPullRequest.value
+        ? {
+            value: {
+              ...facts.integrationPullRequest.value,
+              baseOid: oid("main-1"),
+              merged: false,
+              closed: false,
+              mergeCommitOid: oid("ca73e4a5df68a8c756a4ff4f16018f47b7961e61"),
+            },
+          }
+        : {}),
+    };
+    const writes: import("../../../src/core/model.js").CandidateWrite[] = [];
+    let retargets = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        updatePullRequestBase: async () => {
+          retargets += 1;
+          return {
+            kind: "succeeded" as const,
+            value: facts.sourcePullRequest.value,
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: {
+        readWorkspace: async () => ({
+          status: "ready" as const,
+          value: {
+            status: "ready" as const,
+            integrationHeadOid: oid("integration-1"),
+            retainedCommitOids: [oid("integration-1")],
+            requiredParentOids: [oid("integration-1")],
+          },
+        }),
+        writeIntegrationCandidate: async (
+          candidate: import("../../../src/core/model.js").CandidateWrite,
+        ) => {
+          writes.push(candidate);
+          return { kind: "retryableTransport" as const };
+        },
+      } as unknown as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(result).toEqual({ kind: "retryable", reason: "retryableTransport" });
+    expect(retargets).toBe(0);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.input.observedMainOid).toBe(oid("main-2"));
+    expect(writes[0]?.input.expectedIntegrationHeadOid).toBe(
+      oid("integration-1"),
+    );
+    expect(writes[0]?.postconditions.history.retainCommitOids).not.toContain(
+      oid("ca73e4a5df68a8c756a4ff4f16018f47b7961e61"),
+    );
   });
 
   test("requires confirmation login and reviewed commit to bind the current candidate", async () => {

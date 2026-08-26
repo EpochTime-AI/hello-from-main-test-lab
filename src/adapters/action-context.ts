@@ -51,7 +51,7 @@ export async function createTrustedActionContext(input: {
       ? (record.repository as Record<string, unknown>).full_name
       : undefined;
   const pullRequest = asRecord(record.pull_request);
-  const isPullRequestEvent = env.GITHUB_EVENT_NAME === "pull_request";
+  const isPullRequestEvent = env.GITHUB_EVENT_NAME === "pull_request_target";
   if (eventRef && eventRef !== eventRuntimeRef && !isPullRequestEvent)
     throw new Error("event ref does not match trusted runtime ref");
   if (eventSha && eventSha !== sha && !isPullRequestEvent)

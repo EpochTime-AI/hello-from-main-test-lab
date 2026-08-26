@@ -1780,6 +1780,8 @@ describe("OctokitGithubPlatform", () => {
     let page = 0;
     const pagePullRequest = (number: number) => ({
       number,
+      state: "open",
+      merged: false,
       draft: false,
       head: { ref: `add/user-${number}`, sha: `head-${number}` },
       base: { ref: "main", sha: "main-1" },
@@ -1791,7 +1793,10 @@ describe("OctokitGithubPlatform", () => {
         rest: async (request) => {
           if (request.path.endsWith("/git/ref/heads/main"))
             return { status: 200, data: { object: { sha: "main-1" } } };
-          if (request.path.endsWith("/git/trees/main-1"))
+          if (
+            request.path.endsWith("/git/trees/main-1") ||
+            request.path.endsWith("/git/trees/integration-1")
+          )
             return {
               status: 200,
               data: {
@@ -1807,6 +1812,16 @@ describe("OctokitGithubPlatform", () => {
                 ).toString("base64"),
                 encoding: "base64",
               },
+            };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: { ...pagePullRequest(1), merged: false },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: { ...pagePullRequest(2), merged: false },
             };
           page += 1;
           return page === 1
@@ -1831,6 +1846,33 @@ describe("OctokitGithubPlatform", () => {
               status: 200,
               data: {
                 tree: [{ path: "README.md", type: "blob", sha: "readme" }],
+              },
+            };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "open",
+                merged: false,
+                user: { login: "alice", id: 7 },
+                head: { ref: "add/alice", sha: "source" },
+                base: { ref: "main", sha: "main" },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                draft: true,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "wrong",
+                },
+                base: { ref: "main", sha: "main" },
               },
             };
           if (request.path.endsWith("/git/blobs/readme"))
@@ -1859,7 +1901,7 @@ describe("OctokitGithubPlatform", () => {
     });
   });
 
-  test("uses an explicit merge method, rejects merged:false, and looks up lost responses", async () => {
+  test("uses PUT with an exact head guard, rejects merged:false, and looks up lost responses", async () => {
     const requests: unknown[] = [];
     const rejected = createOctokitGithubPlatform({
       owner: "acme",
@@ -1887,6 +1929,8 @@ describe("OctokitGithubPlatform", () => {
     });
     expect(requests[0]).toEqual(
       expect.objectContaining({
+        method: "PUT",
+        path: "/repos/acme/hello/pulls/3/merge",
         parameters: { sha: "head", merge_method: "merge" },
       }),
     );
@@ -1912,6 +1956,66 @@ describe("OctokitGithubPlatform", () => {
         expectedHeadOid: oid("head"),
       }),
     ).resolves.toEqual({ kind: "contributionMerged", headOid: oid("merge-1") });
+  });
+
+  test("requires an exact merged SHA readback after a successful PUT", async () => {
+    let calls = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      replay: true,
+      transport: {
+        rest: async () => {
+          calls += 1;
+          return calls === 1
+            ? { status: 200, data: { merged: true, sha: "merge-1" } }
+            : {
+                status: 200,
+                data: { merged: true, merge_commit_sha: "other" },
+              };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await expect(
+      platform.mergePullRequest({
+        kind: "contribution",
+        pullRequestNumber: 3,
+        expectedHeadOid: oid("head"),
+      }),
+    ).resolves.toEqual({
+      kind: "contributionRejected",
+      reason: "stalePrecondition",
+    });
+  });
+
+  test.each([
+    [404, "notFound"],
+    [405, "policyRejected"],
+    [409, "stalePrecondition"],
+    [422, "policyRejected"],
+  ] as const)("fails closed for merge response %i", async (status, reason) => {
+    const requests: { method: string }[] = [];
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      replay: true,
+      transport: {
+        rest: async (request) => {
+          requests.push(request);
+          return { status, data: { message: "provider rejection" } };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await expect(
+      platform.mergePullRequest({
+        kind: "contribution",
+        pullRequestNumber: 3,
+        expectedHeadOid: oid("head"),
+      }),
+    ).resolves.toEqual({ kind: "contributionRejected", reason });
+    expect(requests).toEqual([expect.objectContaining({ method: "PUT" })]);
   });
 
   test("fails closed for production Integration merges until a provider base-current gate exists", async () => {
@@ -1993,6 +2097,7 @@ describe("OctokitGithubPlatform", () => {
                 {
                   number: 2,
                   state: "open",
+                  merged: false,
                   user: { login: "bot" },
                   head: {
                     ref: "feature/card-alice-source-1",
@@ -2004,12 +2109,48 @@ describe("OctokitGithubPlatform", () => {
                 },
               ],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "closed",
+                merged: true,
+                merged_at: "2026-08-26T00:00:00Z",
+                merge_commit_sha: "contribution-merge",
+                user: { login: "alice" },
+                head: { ref: "add/alice", sha: "rebased" },
+                base: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration-1",
+                },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration-1",
+                },
+                base: { ref: "main", sha: "main-1" },
+                mergeable: true,
+              },
+            };
           if (request.path.endsWith("/git/matching-refs/heads/feature/card-"))
             return { status: 200, data: [] };
           if (request.path.endsWith("/git/commits/contribution-merge"))
             return {
               status: 200,
-              data: { parents: [{ sha: "integration-1" }, { sha: "rebased" }] },
+              data: {
+                sha: "contribution-merge",
+                parents: [{ sha: "integration-1" }, { sha: "rebased" }],
+              },
             };
           if (request.path.includes("/git/trees/"))
             return {
@@ -2093,6 +2234,376 @@ describe("OctokitGithubPlatform", () => {
     ]);
   });
 
+  test("hydrates source and Integration lifecycle facts from exact PR GET responses", async () => {
+    const requests: string[] = [];
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport: {
+        rest: async (request) => {
+          requests.push(request.path);
+          if (request.path.endsWith("/git/ref/heads/main"))
+            return { status: 200, data: { object: { sha: "main" } } };
+          if (request.path.endsWith("/pulls"))
+            return {
+              status: 200,
+              data: [
+                {
+                  number: 1,
+                  state: "closed",
+                  merged: null,
+                  user: { login: "alice", id: 7 },
+                  head: {
+                    ref: "add/alice",
+                    sha: "source",
+                    repo: { fork: true, owner: { login: "alice" } },
+                  },
+                  base: { ref: "feature/card-alice-source-1", sha: "shell" },
+                },
+                {
+                  number: 2,
+                  state: "open",
+                  user: { login: "bot" },
+                  head: {
+                    ref: "feature/card-alice-source-1",
+                    sha: "candidate",
+                  },
+                  base: { ref: "main", sha: "main" },
+                },
+              ],
+            };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "closed",
+                merged: true,
+                merged_at: "2026-08-26T11:00:21Z",
+                merge_commit_sha: "source-merge",
+                user: { login: "alice", id: 7 },
+                head: { ref: "add/alice", sha: "source" },
+                base: { ref: "feature/card-alice-source-1", sha: "shell" },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate",
+                },
+                base: { ref: "main", sha: "main" },
+                mergeable: true,
+              },
+            };
+          if (request.path.endsWith("/pulls/1/files"))
+            return { status: 200, data: [] };
+          if (request.path.endsWith("/git/commits/source-merge"))
+            return {
+              status: 200,
+              data: {
+                sha: "source-merge",
+                parents: [{ sha: "shell" }, { sha: "source" }],
+              },
+            };
+          if (request.path.endsWith("/git/trees/main"))
+            return {
+              status: 200,
+              data: {
+                tree: [{ path: "README.md", type: "blob", sha: "readme" }],
+              },
+            };
+          if (request.path.endsWith("/git/blobs/readme"))
+            return {
+              status: 200,
+              data: {
+                encoding: "base64",
+                content: Buffer.from(
+                  "<!-- cards:start -->\n<!-- cards:end -->\n",
+                ).toString("base64"),
+              },
+            };
+          if (request.path.includes("/git/trees/"))
+            return { status: 200, data: { tree: [] } };
+          if (request.path.endsWith("/pulls/2/reviews"))
+            return { status: 200, data: [] };
+          if (request.path.endsWith("/commits/candidate/check-runs"))
+            return { status: 200, data: { check_runs: [] } };
+          throw new Error(`unexpected ${request.method} ${request.path}`);
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+
+    const observed = await platform.observeRepository();
+
+    expect(observed).toMatchObject({ status: "ready" });
+    expect(observed.value?.sourcePullRequest.value).toMatchObject({
+      number: 1,
+      merged: true,
+      closed: true,
+      headOid: oid("source"),
+      baseOid: oid("shell"),
+      mergeCommitOid: oid("source-merge"),
+      mergeParentOids: [oid("shell"), oid("source")],
+    });
+    expect(observed.value?.integrationPullRequest.value).toMatchObject({
+      number: 2,
+      merged: false,
+      headOid: oid("candidate"),
+      baseOid: oid("main"),
+    });
+    expect(
+      requests.filter((path) =>
+        /^\/repos\/acme\/hello\/pulls\/\d+$/u.test(path),
+      ),
+    ).toEqual(["/repos/acme/hello/pulls/1", "/repos/acme/hello/pulls/2"]);
+  });
+
+  test.each([
+    ["missing merged_at", { merged: true, merged_at: undefined }],
+    ["missing merge commit", { merged: true, merge_commit_sha: undefined }],
+    [
+      "invalid merged_at timestamp",
+      { merged: true, merged_at: "not-a-timestamp" },
+    ],
+    ["mismatched exact number", { number: 99, merged: true }],
+  ] as const)(
+    "marks malformed closed lifecycle as incomplete: %s",
+    async (_name, patch) => {
+      const platform = createLifecycleObservationPlatform({
+        sourceList: {
+          state: "closed",
+          merged: null,
+          merge_commit_sha: "source-merge",
+        },
+        sourceExact: {
+          number: 1,
+          state: "closed",
+          merged_at: "2026-08-26T11:00:21Z",
+          merge_commit_sha: "source-merge",
+          ...patch,
+        },
+      });
+
+      await expect(platform.observeRepository()).resolves.toMatchObject({
+        status: "incomplete",
+      });
+    },
+  );
+
+  test.each([
+    "2026-02-29T11:00:21Z",
+    "2026-02-30T11:00:21Z",
+    "2024-02-30T11:00:21Z",
+    "2026-04-31T11:00:21Z",
+    "2026-13-01T11:00:21Z",
+    "2026-01-00T11:00:21Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z",
+  ])(
+    "marks impossible UTC calendar timestamp incomplete: %s",
+    async (mergedAt) => {
+      const platform = createLifecycleObservationPlatform({
+        sourceList: { state: "closed", merged: null },
+        sourceExact: {
+          state: "closed",
+          merged: true,
+          merged_at: mergedAt,
+          merge_commit_sha: "source-merge",
+        },
+      });
+
+      await expect(platform.observeRepository()).resolves.toMatchObject({
+        status: "incomplete",
+      });
+    },
+  );
+
+  test.each(["2024-02-29T11:00:21Z", "2026-08-26T11:00:21.123456Z"])(
+    "accepts valid UTC calendar timestamp: %s",
+    async (mergedAt) => {
+      const platform = createLifecycleObservationPlatform({
+        sourceList: { state: "closed", merged: null },
+        sourceExact: {
+          state: "closed",
+          merged: true,
+          merged_at: mergedAt,
+          merge_commit_sha: "source-merge",
+        },
+      });
+
+      await expect(platform.observeRepository()).resolves.toMatchObject({
+        status: "ready",
+      });
+    },
+  );
+
+  test("preserves an exact closed-unmerged source as a policy fact", async () => {
+    const platform = createLifecycleObservationPlatform({
+      sourceList: { state: "closed", merged: null },
+      sourceExact: {
+        number: 1,
+        state: "closed",
+        merged: false,
+        merged_at: null,
+        merge_commit_sha: null,
+      },
+    });
+
+    const observed = await platform.observeRepository();
+
+    expect(observed).toMatchObject({ status: "ready" });
+    expect(observed.value?.sourcePullRequest.value).toMatchObject({
+      closed: true,
+      merged: false,
+    });
+    expect(observed.value?.sourcePullRequest.value).not.toHaveProperty(
+      "mergeCommitOid",
+    );
+  });
+
+  test.each([
+    [
+      "head ref",
+      { head: { ref: "feature/card-other-source-1", sha: "candidate" } },
+    ],
+    ["base ref", { base: { ref: "release", sha: "main" } }],
+  ] as const)(
+    "marks exact Integration PR %s mismatch incomplete",
+    async (_name, patch) => {
+      const platform = createLifecycleObservationPlatform({
+        sourceList: { state: "open" },
+        sourceExact: { state: "open", merged: false },
+        integrationExact: { mergeable: true, ...patch },
+      });
+
+      await expect(platform.observeRepository()).resolves.toMatchObject({
+        status: "incomplete",
+      });
+    },
+  );
+
+  test.each([
+    ["head", { head: { ref: "add/alice", sha: "other" } }],
+    ["base", { base: { ref: "feature/card-alice-source-1", sha: "other" } }],
+    ["head ref", { head: { ref: "add/other", sha: "source" } }],
+    ["base ref", { base: { ref: "release", sha: "shell" } }],
+  ] as const)(
+    "marks exact PR %s OID mismatch incomplete",
+    async (_name, patch) => {
+      const platform = createLifecycleObservationPlatform({
+        sourceList: { state: "closed", merged: null },
+        sourceExact: {
+          number: 1,
+          state: "closed",
+          merged: false,
+          merged_at: null,
+          merge_commit_sha: null,
+          ...patch,
+        },
+      });
+
+      await expect(platform.observeRepository()).resolves.toMatchObject({
+        status: "incomplete",
+      });
+    },
+  );
+
+  test("accepts a live-shaped open Integration PR without treating its synthetic merge SHA as a fact", async () => {
+    const requests: string[] = [];
+    const platform = createLifecycleObservationPlatform({
+      sourceList: { state: "open" },
+      sourceExact: { state: "open", merged: false },
+      integrationExact: {
+        merged_at: null,
+        merge_commit_sha: "ca73e4a5df68a8c756a4ff4f16018f47b7961e61",
+        mergeable: true,
+        mergeable_state: "clean",
+      },
+      onRequest: (request) => requests.push(request.path),
+    });
+
+    const observed = await platform.observeRepository();
+
+    expect(observed).toMatchObject({ status: "ready" });
+    expect(observed.value?.integrationPullRequest.value).toMatchObject({
+      number: 2,
+      merged: false,
+    });
+    expect(observed.value?.integrationPullRequest.value).not.toHaveProperty(
+      "mergeCommitOid",
+    );
+    expect(observed.value?.integrationPullRequest.value).not.toHaveProperty(
+      "mergeParentOids",
+    );
+    expect(requests).not.toContain(
+      "/repos/acme/hello/git/commits/ca73e4a5df68a8c756a4ff4f16018f47b7961e61",
+    );
+  });
+
+  test.each([
+    ["merged", { merged: true }],
+    ["merged_at", { merged_at: "2026-08-26T00:00:00Z" }],
+  ] as const)("marks open PR with %s incomplete", async (_name, patch) => {
+    const platform = createLifecycleObservationPlatform({
+      sourceList: { state: "open" },
+      sourceExact: { state: "open", merged: false, ...patch },
+    });
+
+    await expect(platform.observeRepository()).resolves.toMatchObject({
+      status: "incomplete",
+    });
+  });
+
+  test("uses exact Integration mergeability and fails closed when it is absent", async () => {
+    const exactFalse = createLifecycleObservationPlatform({
+      sourceList: { state: "open" },
+      sourceExact: { state: "open", merged: false },
+      integrationList: { mergeable: true },
+      integrationExact: { mergeable: false },
+    });
+    const absent = createLifecycleObservationPlatform({
+      sourceList: { state: "open" },
+      sourceExact: { state: "open", merged: false },
+      integrationList: { mergeable: true },
+      integrationExact: { mergeable: undefined },
+    });
+
+    await expect(exactFalse.observeRepository()).resolves.toMatchObject({
+      status: "ready",
+      value: { eligibility: { mergeability: { value: null } } },
+    });
+    await expect(absent.observeRepository()).resolves.toMatchObject({
+      status: "ready",
+      value: { eligibility: { mergeability: { status: "incomplete" } } },
+    });
+  });
+
+  test("rejects a merge-commit GET whose sha differs from the exact PR", async () => {
+    const platform = createLifecycleObservationPlatform({
+      sourceList: { state: "closed", merged: null },
+      sourceExact: {
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-26T11:00:21Z",
+        merge_commit_sha: "source-merge",
+      },
+      mergeCommit: { sha: "other-merge" },
+    });
+
+    await expect(platform.observeRepository()).resolves.toMatchObject({
+      status: "incomplete",
+    });
+  });
+
   test("binds source and Integration PR discovery to the requested run", async () => {
     const requests: string[] = [];
     const platform = createOctokitGithubPlatform({
@@ -2137,8 +2648,53 @@ describe("OctokitGithubPlatform", () => {
                 },
               ],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "open",
+                merged: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: { ref: "feature/card-alice-source-1", sha: "shell" },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "wrong",
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            };
           if (request.path.endsWith("/pulls/1/files"))
             return { status: 200, data: [] };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "same-head",
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            };
           if (request.path.endsWith("/git/trees/main"))
             return {
               status: 200,
@@ -2171,6 +2727,7 @@ describe("OctokitGithubPlatform", () => {
       expectedSourcePullRequestNumber: 1,
       expectedSourceLogin: "alice",
     });
+    if (observed.status !== "ready") throw new Error(JSON.stringify(observed));
     expect(observed.value?.sourcePullRequest.value?.number).toBe(1);
     expect(observed.value?.integrationPullRequest.value?.headRef).toBe(
       "feature/card-alice-source-1",
@@ -2222,8 +2779,40 @@ describe("OctokitGithubPlatform", () => {
                 },
               ],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "open",
+                merged: false,
+                draft: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            };
           if (request.path.endsWith("/pulls/1/files"))
             return { status: 200, data: [] };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "same-head",
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            };
           if (request.path.endsWith("/git/trees/main"))
             return {
               status: 200,
@@ -2262,6 +2851,7 @@ describe("OctokitGithubPlatform", () => {
       expectedSourcePullRequestNumber: 1,
       expectedSourceLogin: "alice",
     });
+    if (observed.status !== "ready") throw new Error(JSON.stringify(observed));
     expect(observed.value?.integrationPullRequest.value?.number).toBe(2);
     expect(
       observed.value?.eligibility.reviews.value?.every(
@@ -2307,6 +2897,36 @@ describe("OctokitGithubPlatform", () => {
                   base: { ref: "main", sha: "main" },
                 },
               ],
+            };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "open",
+                merged: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: { ref: "feature/card-alice-source-1", sha: "shell" },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate",
+                },
+                base: { ref: "main", sha: "main" },
+              },
             };
           if (request.path.endsWith("/pulls/1/files"))
             return { status: 200, data: [] };
@@ -2452,10 +3072,43 @@ describe("OctokitGithubPlatform", () => {
                 },
               ],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "closed",
+                merged: true,
+                merged_at: "2026-08-26T00:00:00Z",
+                merge_commit_sha: "contribution-merge",
+                user: { login: "alice" },
+                head: { ref: "add/alice", sha: "contribution-1" },
+                base: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate-1",
+                },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate-1",
+                },
+                base: { ref: "main", sha: "main-1" },
+              },
+            };
           if (request.path.endsWith("/git/commits/contribution-merge"))
             return {
               status: 200,
               data: {
+                sha: "contribution-merge",
                 parents: [{ sha: "candidate-1" }, { sha: "contribution-1" }],
               },
             };
@@ -2594,6 +3247,45 @@ describe("OctokitGithubPlatform", () => {
                 },
               ],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "closed",
+                merged: true,
+                merged_at: "2026-08-26T00:00:00Z",
+                merge_commit_sha: "contribution-merge",
+                user: { login: "alice" },
+                head: { ref: "add/alice", sha: "source" },
+                base: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate-1",
+                },
+              },
+            };
+          if (request.path.endsWith("/pulls/2"))
+            return {
+              status: 200,
+              data: {
+                number: 2,
+                state: "open",
+                merged: false,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate-1",
+                },
+                base: { ref: "main", sha: "main-1" },
+              },
+            };
+          if (request.path.endsWith("/git/commits/contribution-merge"))
+            return {
+              status: 200,
+              data: {
+                sha: "contribution-merge",
+                parents: [{ sha: "candidate-1" }, { sha: "source" }],
+              },
+            };
           if (request.path.endsWith("/git/trees/main-1"))
             return {
               status: 200,
@@ -2665,6 +3357,23 @@ describe("OctokitGithubPlatform", () => {
               status: 200,
               data: [{ filename: "people/alice.md", sha: "card" }],
             };
+          if (request.path.endsWith("/pulls/1"))
+            return {
+              status: 200,
+              data: {
+                number: 1,
+                state: "open",
+                merged: false,
+                draft: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            };
           if (request.path.endsWith("/git/trees/main"))
             return {
               status: 200,
@@ -2706,6 +3415,627 @@ describe("OctokitGithubPlatform", () => {
         }),
       ],
     });
+  });
+
+  test("aggregates validated multi-page Compare links and rejects duplicate commits", async () => {
+    const transport = (duplicate = false): OctokitRequestTransport => ({
+      rest: async (request) => {
+        if (request.path.endsWith("/git/ref/heads/main"))
+          return { status: 200, data: { object: { sha: "main" } } };
+        if (request.path.endsWith("/pulls"))
+          return {
+            status: 200,
+            data: [
+              {
+                number: 1,
+                state: "open",
+                draft: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration",
+                },
+              },
+              {
+                number: 2,
+                state: "open",
+                draft: true,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration",
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            ],
+          };
+        if (request.path.endsWith("/pulls/1"))
+          return {
+            status: 200,
+            data: {
+              number: 1,
+              state: "open",
+              merged: false,
+              draft: false,
+              user: { login: "alice", id: 7 },
+              head: { ref: "add/alice", sha: "source" },
+              base: { ref: "feature/card-alice-source-1", sha: "integration" },
+            },
+          };
+        if (request.path.endsWith("/pulls/2"))
+          return {
+            status: 200,
+            data: {
+              number: 2,
+              state: "open",
+              merged: false,
+              draft: true,
+              head: { ref: "feature/card-alice-source-1", sha: "integration" },
+              base: { ref: "main", sha: "main" },
+            },
+          };
+        if (request.path.includes("matching-refs"))
+          return { status: 200, data: [] };
+        if (request.path === "/repos/acme/hello/compare/integration...source")
+          return {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: { sha: "integration" },
+              head_commit: { sha: "source" },
+              merge_base_commit: { sha: "integration" },
+              commits: [{ sha: "one" }],
+              total_commits: 2,
+            },
+            headers: {
+              link: '<https://api.github.com/repos/acme/hello/compare/integration...source?per_page=100&page=2>; rel="next"',
+            },
+          };
+        if (
+          request.path ===
+          "/repos/acme/hello/compare/integration...source?per_page=100&page=2"
+        )
+          return {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: { sha: "integration" },
+              head_commit: { sha: "source" },
+              merge_base_commit: { sha: "integration" },
+              commits: [{ sha: duplicate ? "one" : "two" }],
+              total_commits: 2,
+            },
+          };
+        if (request.path.endsWith("/pulls/1/files"))
+          return {
+            status: 200,
+            data: [{ filename: "people/alice.md", sha: "card" }],
+          };
+        if (
+          request.path.endsWith("/git/trees/main") ||
+          request.path.endsWith("/git/trees/integration")
+        )
+          return {
+            status: 200,
+            data: {
+              tree: [{ path: "README.md", type: "blob", sha: "readme" }],
+            },
+          };
+        if (request.path.endsWith("/git/blobs/readme"))
+          return {
+            status: 200,
+            data: {
+              encoding: "base64",
+              content: Buffer.from("# Hello\n").toString("base64"),
+            },
+          };
+        if (request.path.endsWith("/git/blobs/card"))
+          return {
+            status: 200,
+            data: {
+              encoding: "base64",
+              content: Buffer.from(
+                "---\ngithub: alice\ngithub_id: 7\nsource_pr: 1\n---\n\n# Alice\n\n最近在折腾：Git\n\n> Hi\n",
+              ).toString("base64"),
+            },
+          };
+        if (request.path.endsWith("/commits/integration/check-runs"))
+          return { status: 200, data: { check_runs: [] } };
+        if (request.path.endsWith("/pulls/2/reviews"))
+          return { status: 200, data: [] };
+        throw new Error(`unexpected ${request.path}`);
+      },
+      graphql: async () => ({ data: {} }),
+    });
+    const complete = await createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport: transport(),
+    }).observeRepository();
+    expect(complete.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: { isAncestor: true },
+    });
+    const malformed = await createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport: transport(true),
+    }).observeRepository();
+    expect(malformed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "incomplete",
+    });
+  });
+
+  test("accepts the live one-page Compare payload without head_commit and first-only Link", async () => {
+    const observed = await createOctokitGithubPlatform({
+      owner: "EpochTime-AI",
+      repo: "hello-from-main-test-lab",
+      repositoryId: 1346809298,
+      transport: liveCompareTransport([
+        {
+          status: 200,
+          data: {
+            status: "ahead",
+            base_commit: {
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+            merge_base_commit: {
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+            total_commits: 1,
+            commits: [
+              {
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                parents: [{ sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" }],
+              },
+            ],
+          },
+          headers: {
+            link: '<https://api.github.com/repositories/1346809298/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="first"',
+          },
+        },
+      ]),
+    }).observeRepository();
+
+    expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: {
+        integrationHeadOid: oid("acad22238c3b830352b8ac722da9c6ba1751b7dd"),
+        sourceHeadOid: oid("1ce6aff2da2284107da36d4ecf5bebd647e18c4b"),
+        isAncestor: true,
+      },
+    });
+  });
+
+  test("proves an absent Compare head from the final aggregated ahead commit", async () => {
+    const pages = [
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "intermediate" }],
+        },
+        headers: {
+          link: '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+        },
+      },
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+        },
+      },
+    ];
+    const observed = await createOctokitGithubPlatform({
+      owner: "EpochTime-AI",
+      repo: "hello-from-main-test-lab",
+      repositoryId: 1346809298,
+      transport: liveCompareTransport(pages),
+    }).observeRepository();
+
+    expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: { isAncestor: true },
+    });
+  });
+
+  test("rejects absent-head Compare proofs that do not match the requested status", async () => {
+    const cases = [
+      {
+        status: "ahead",
+        total_commits: 1,
+        commits: [{ sha: "not-the-requested-source" }],
+      },
+      { status: "identical", total_commits: 1, commits: [] },
+      { status: "behind", total_commits: 0, commits: [] },
+      { status: "diverged", total_commits: 0, commits: [] },
+    ] as const;
+
+    for (const compare of cases) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              ...compare,
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("keeps present-head behind and diverged Compare facts complete but non-ancestral", async () => {
+    for (const status of ["behind", "diverged"] as const) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status,
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              head_commit: {
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 0,
+              commits: [],
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+        value: {
+          sourceHeadOid: oid("1ce6aff2da2284107da36d4ecf5bebd647e18c4b"),
+          isAncestor: false,
+        },
+      });
+    }
+  });
+
+  test("requires identical Compare results to bind equal requested OIDs with zero commits", async () => {
+    for (const compare of [
+      {
+        base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        head_commit: { sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" },
+        total_commits: 0,
+        commits: [],
+      },
+      {
+        base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        head_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        total_commits: 1,
+        commits: [{ sha: "unexpected" }],
+      },
+    ]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "identical",
+              ...compare,
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("rejects a present malformed or mismatched Compare head_commit", async () => {
+    for (const head_commit of [{}, { sha: "wrong-source" }]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              head_commit,
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 1,
+              commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("treats syntactically valid Compare Link headers without next as terminal", async () => {
+    for (const link of [
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="first"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="prev", <https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="last"',
+    ]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 1,
+              commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+            },
+            headers: { link },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+      });
+    }
+  });
+
+  test("rejects malformed, duplicate, wrong, looping, and nonprogressing Compare next links", async () => {
+    const links = [
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next", broken',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next", <https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=3>; rel="next"',
+      '<https://attacker.invalid/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/other/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=50&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="next"',
+    ];
+
+    for (const link of links) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 2,
+              commits: [{ sha: "intermediate" }],
+            },
+            headers: { link },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("follows canonical and numeric GHES Compare links with the /api/v3 prefix exactly once", async () => {
+    const comparePath =
+      "/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b";
+    const pages = [
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          head_commit: {
+            sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+          },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "intermediate" }],
+        },
+      },
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          head_commit: {
+            sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+          },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+        },
+      },
+    ];
+    for (const linkPath of [
+      `/api/v3/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/api/v3/repositories/1346809298${comparePath}`,
+    ]) {
+      const requests: string[] = [];
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        apiOrigin: "https://ghe.example/api/v3",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport(
+          pages.map((page, index) =>
+            index === 0
+              ? {
+                  ...page,
+                  headers: {
+                    link: `<https://ghe.example${linkPath}?per_page=100&page=2>; rel="next"`,
+                  },
+                }
+              : page,
+          ),
+          (request) => requests.push(request.path),
+        ),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+        value: { isAncestor: true },
+      });
+      const expectedFollowUpPath = linkPath.includes("/repositories/")
+        ? `/repositories/1346809298${comparePath}?per_page=100&page=2`
+        : `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}?per_page=100&page=2`;
+      expect(requests.filter((path) => path.includes("/compare/"))).toEqual([
+        `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+        expectedFollowUpPath,
+      ]);
+      expect(
+        requests
+          .filter((path) => path.includes("/compare/"))
+          .every((path) => !path.includes("/api/v3/")),
+      ).toBe(true);
+    }
+  });
+
+  test("adds the GHES API prefix exactly once when transporting Compare follow-up paths", async () => {
+    const originalFetch = globalThis.fetch;
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({}), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const transport = createGithubTransport(
+        "token",
+        "https://ghe.example/api/v3",
+      );
+      await transport.rest({
+        method: "GET",
+        path: "/repositories/1346809298/compare/base...head",
+        parameters: { per_page: 100, page: 2 },
+      });
+      await transport.rest({
+        method: "GET",
+        path: "/repos/acme/hello/compare/base...head",
+        parameters: { per_page: 100, page: 2 },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(urls).toEqual([
+      "https://ghe.example/api/v3/repositories/1346809298/compare/base...head?per_page=100&page=2",
+      "https://ghe.example/api/v3/repos/acme/hello/compare/base...head?per_page=100&page=2",
+    ]);
+    expect(urls.every((url) => url.match(/\/api\/v3/g)?.length === 1)).toBe(
+      true,
+    );
+  });
+
+  test("rejects GHES Compare links with a missing or wrong API prefix", async () => {
+    const comparePath =
+      "/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b";
+    for (const linkPath of [
+      `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/repositories/1346809298${comparePath}`,
+      `/api/v2/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/api/v2/repositories/1346809298${comparePath}`,
+    ]) {
+      const requests: string[] = [];
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        apiOrigin: "https://ghe.example/api/v3",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport(
+          [
+            {
+              status: 200,
+              data: {
+                status: "ahead",
+                base_commit: {
+                  sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+                },
+                head_commit: {
+                  sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                },
+                merge_base_commit: {
+                  sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+                },
+                total_commits: 2,
+                commits: [{ sha: "intermediate" }],
+              },
+              headers: {
+                link: `<https://ghe.example${linkPath}?per_page=100&page=2>; rel="next"`,
+              },
+            },
+          ],
+          (request) => requests.push(request.path),
+        ),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+      expect(
+        requests.filter((path) => path.includes("/compare/")),
+      ).toHaveLength(1);
+    }
   });
 
   test("accepts canonical string source and active identities without numeric coercion", async () => {
@@ -2775,6 +4105,23 @@ function identityObservationTransport(
         };
       if (request.path.endsWith("/git/matching-refs/heads/feature/card-"))
         return { status: 200, data: [] };
+      if (request.path.endsWith("/pulls/1"))
+        return {
+          status: 200,
+          data: {
+            number: 1,
+            state: "open",
+            merged: false,
+            draft: false,
+            user: { login: "alice", id: sourceId },
+            head: {
+              ref: "add/alice",
+              sha: "source",
+              repo: { fork: true, owner: { login: "alice" } },
+            },
+            base: { ref: "main", sha: "main" },
+          },
+        };
       if (request.path.endsWith("/pulls/1/files"))
         return { status: 200, data: [] };
       if (request.path.endsWith("/git/trees/main"))
@@ -2793,6 +4140,274 @@ function identityObservationTransport(
           },
         };
       throw new Error(`unexpected ${request.path}`);
+    },
+    graphql: async () => ({ data: {} }),
+  };
+}
+
+function createLifecycleObservationPlatform(input: {
+  sourceList: Record<string, unknown>;
+  sourceExact: Record<string, unknown>;
+  integrationList?: Record<string, unknown>;
+  integrationExact?: Record<string, unknown>;
+  mergeCommit?: Record<string, unknown>;
+  onRequest?: (request: { method: string; path: string }) => void;
+}) {
+  return createOctokitGithubPlatform({
+    owner: "acme",
+    repo: "hello",
+    transport: {
+      rest: async (request) => {
+        input.onRequest?.(request);
+        if (request.path.endsWith("/git/ref/heads/main"))
+          return { status: 200, data: { object: { sha: "main" } } };
+        if (request.path.endsWith("/pulls"))
+          return {
+            status: 200,
+            data: [
+              {
+                number: 1,
+                ...input.sourceList,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: { ref: "feature/card-alice-source-1", sha: "shell" },
+              },
+              {
+                number: 2,
+                state: "open",
+                merged: false,
+                user: { login: "bot" },
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "candidate",
+                },
+                base: { ref: "main", sha: "main" },
+                ...input.integrationList,
+              },
+            ],
+          };
+        if (request.path.endsWith("/pulls/1"))
+          return {
+            status: 200,
+            data: {
+              number: 1,
+              state: "closed",
+              user: { login: "alice", id: 7 },
+              head: { ref: "add/alice", sha: "source" },
+              base: { ref: "feature/card-alice-source-1", sha: "shell" },
+              ...input.sourceExact,
+            },
+          };
+        if (request.path.endsWith("/pulls/2"))
+          return {
+            status: 200,
+            data: {
+              number: 2,
+              state: "open",
+              merged: false,
+              user: { login: "bot" },
+              head: { ref: "feature/card-alice-source-1", sha: "candidate" },
+              base: { ref: "main", sha: "main" },
+              ...input.integrationExact,
+            },
+          };
+        if (request.path.endsWith("/pulls/1/files"))
+          return { status: 200, data: [] };
+        if (request.path.includes("/compare/"))
+          return {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: { sha: "candidate" },
+              head_commit: { sha: "source" },
+              merge_base_commit: { sha: "candidate" },
+              commits: [{ sha: "source" }],
+              total_commits: 1,
+            },
+          };
+        if (request.path.endsWith("/git/commits/source-merge"))
+          return {
+            status: 200,
+            data: {
+              sha: "source-merge",
+              parents: [{ sha: "shell" }, { sha: "source" }],
+              ...input.mergeCommit,
+            },
+          };
+        if (request.path.endsWith("/git/trees/main"))
+          return {
+            status: 200,
+            data: {
+              tree: [{ path: "README.md", type: "blob", sha: "readme" }],
+            },
+          };
+        if (request.path.endsWith("/git/blobs/readme"))
+          return {
+            status: 200,
+            data: {
+              encoding: "base64",
+              content: Buffer.from(
+                "<!-- cards:start -->\n<!-- cards:end -->\n",
+              ).toString("base64"),
+            },
+          };
+        if (request.path.includes("/git/trees/"))
+          return { status: 200, data: { tree: [] } };
+        if (request.path.endsWith("/pulls/2/reviews"))
+          return { status: 200, data: [] };
+        if (request.path.endsWith("/commits/candidate/check-runs"))
+          return { status: 200, data: { check_runs: [] } };
+        throw new Error(`unexpected ${request.method} ${request.path}`);
+      },
+      graphql: async () => ({ data: {} }),
+    },
+  });
+}
+
+function liveCompareTransport(
+  comparePages: readonly {
+    status: number;
+    data: unknown;
+    headers?: Record<string, string>;
+  }[],
+  onRequest?: (request: { method: string; path: string }) => void,
+): OctokitRequestTransport {
+  let comparePage = 0;
+  return {
+    rest: async (request) => {
+      onRequest?.(request);
+      if (request.path.endsWith("/git/ref/heads/main"))
+        return { status: 200, data: { object: { sha: "main" } } };
+      if (request.path.endsWith("/pulls"))
+        return {
+          status: 200,
+          data: [
+            {
+              number: 1,
+              state: "open",
+              draft: false,
+              user: { login: "c-w-xiaohei", id: 88074703 },
+              head: {
+                ref: "add/c-w-xiaohei",
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                repo: { fork: true, owner: { login: "c-w-xiaohei" } },
+              },
+              base: {
+                ref: "feature/card-c-w-xiaohei-source-1",
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+            {
+              number: 2,
+              state: "open",
+              draft: true,
+              head: {
+                ref: "feature/card-c-w-xiaohei-source-1",
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              base: { ref: "main", sha: "main" },
+            },
+          ],
+        };
+      if (request.path.endsWith("/pulls/1"))
+        return {
+          status: 200,
+          data: {
+            number: 1,
+            state: "open",
+            merged: false,
+            user: { login: "c-w-xiaohei", id: 88074703 },
+            head: {
+              ref: "add/c-w-xiaohei",
+              sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+              repo: { fork: true, owner: { login: "c-w-xiaohei" } },
+            },
+            base: {
+              ref: "feature/card-c-w-xiaohei-source-1",
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+          },
+        };
+      if (request.path.endsWith("/pulls/2"))
+        return {
+          status: 200,
+          data: {
+            number: 2,
+            state: "open",
+            merged: false,
+            draft: true,
+            head: {
+              ref: "feature/card-c-w-xiaohei-source-1",
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+            base: { ref: "main", sha: "main" },
+          },
+        };
+      if (request.path.includes("/compare/")) {
+        const page = comparePages[comparePage];
+        if (!page) throw new Error("unexpected Compare page");
+        comparePage += 1;
+        return page;
+      }
+      if (request.path.endsWith("/pulls/1/files"))
+        return {
+          status: 200,
+          data: [
+            {
+              filename: "people/c-w-xiaohei.md",
+              sha: "94537e81de442e570daccef4b96267b06145cb6d",
+            },
+          ],
+        };
+      if (request.path.endsWith("/git/trees/main"))
+        return {
+          status: 200,
+          data: { tree: [{ path: "README.md", type: "blob", sha: "readme" }] },
+        };
+      if (
+        request.path.endsWith(
+          "/git/trees/acad22238c3b830352b8ac722da9c6ba1751b7dd",
+        )
+      )
+        return {
+          status: 200,
+          data: { tree: [{ path: "README.md", type: "blob", sha: "readme" }] },
+        };
+      if (request.path.endsWith("/git/blobs/readme"))
+        return {
+          status: 200,
+          data: {
+            encoding: "base64",
+            content: Buffer.from("# Hello\n").toString("base64"),
+          },
+        };
+      if (
+        request.path.endsWith(
+          "/git/blobs/94537e81de442e570daccef4b96267b06145cb6d",
+        )
+      )
+        return {
+          status: 200,
+          data: {
+            encoding: "base64",
+            content: Buffer.from(
+              "---\ngithub: c-w-xiaohei\ngithub_id: 88074703\nsource_pr: 1\n---\n\n# Card\n\n最近在折腾：Git\n\n> Hi\n",
+            ).toString("base64"),
+          },
+        };
+      if (
+        request.path.endsWith(
+          "/commits/acad22238c3b830352b8ac722da9c6ba1751b7dd/check-runs",
+        )
+      )
+        return { status: 200, data: { check_runs: [] } };
+      if (request.path.endsWith("/pulls/2/reviews"))
+        return { status: 200, data: [] };
+      throw new Error(`unexpected ${request.method} ${request.path}`);
     },
     graphql: async () => ({ data: {} }),
   };

@@ -269,9 +269,16 @@ describe("Core comment contracts", () => {
       (facts: ReturnType<typeof stabilityFacts>) => {
         const branch = facts.integrationBranch.value;
         if (!branch) throw new Error("branch is required");
+        const source = facts.sourcePullRequest.value;
+        if (!source) throw new Error("source is required");
         facts.integrationBranch.value = {
           ...branch,
           headOid: oid("other-base"),
+        };
+        facts.sourcePullRequest.value = {
+          ...source,
+          merged: false,
+          closed: false,
         };
       },
     ],
@@ -295,6 +302,17 @@ describe("Core comment contracts", () => {
       ...source,
       headOid: oid("contribution-2"),
       observedOid: oid("contribution-2"),
+    };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "ready",
+      provenance: "modeled",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: oid("contribution-1"),
+        isAncestor: true,
+        observedOid: oid("contribution-1"),
+        provenance: "modeled",
+      },
     };
     const second = validateIntake(facts, testCandidatePolicy);
     expect(second.kind).toBe("valid");
@@ -650,6 +668,8 @@ describe("Core comment contracts", () => {
         requiredParentOids: [],
       },
     };
+    const durableCandidate = facts.candidate.value;
+    if (!durableCandidate) throw new Error("candidate is required");
     facts.confirmations = [
       {
         kind: "domainConfirmation",
@@ -768,6 +788,7 @@ describe("Core comment contracts", () => {
         value: {
           status: "ready",
           integrationHeadOid: integration.headOid,
+          candidate: durableCandidate,
           retainedCommitOids: [integration.headOid],
           requiredParentOids: [],
         },

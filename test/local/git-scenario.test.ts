@@ -65,6 +65,50 @@ describe("real local Git scenario", () => {
     }
   });
 
+  test("binds local ancestry to the exact fetched contributor head", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const integration = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      await scenario.contributor.rebaseAndInspectConflict();
+      await scenario.contributor.resolveCard(resolvedAliceCardBytes);
+      await scenario.contributor.continueRebase();
+      await scenario.contributor.pushForceWithLease();
+      const source = oid(
+        (
+          await runner.run(["rev-parse", "HEAD"], {
+            cwd: scenario.contributorPath,
+          })
+        ).stdout.trim(),
+      );
+      await expect(
+        scenario.botWorkspace.isAncestor(
+          integration,
+          "contributor/add/alice",
+          source,
+        ),
+      ).resolves.toEqual({ isAncestor: true, sourceHeadOid: source });
+      await expect(
+        scenario.botWorkspace.isAncestor(
+          integration,
+          "contributor/add/alice",
+          oid("wrong-source"),
+        ),
+      ).resolves.toMatchObject({ isAncestor: false, sourceHeadOid: source });
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
   test("reads final main bytes and DAG facts from the remote after a real no-ff merge", async () => {
     const scenario = await createGoodFirstConflictScenario({
       prebuiltIntegration: true,

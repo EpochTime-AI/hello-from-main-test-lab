@@ -3,11 +3,7 @@ import { gitBlobOid, oid } from "../../src/core/model.js";
 import { createReconciler } from "../../src/core/reconciler.js";
 import type { GitWorkspace } from "../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../src/ports/github-platform.js";
-import {
-  readyWorkspace,
-  stabilityFacts,
-  testCandidatePolicy,
-} from "../fixtures/stability.js";
+import { stabilityFacts, testCandidatePolicy } from "../fixtures/stability.js";
 
 function publishableFacts() {
   const facts = stabilityFacts();
@@ -93,20 +89,37 @@ function platform(facts: ReturnType<typeof publishableFacts>) {
   };
 }
 
-const workspace: GitWorkspace = {
-  readWorkspace: readyWorkspace,
-  writeIntegrationCandidate: async () => ({
-    kind: "succeeded",
-    value: { status: "ready" },
-  }),
-  readFinalMainPostconditions: async () => ({ status: "pending" }),
-};
+function workspace(
+  candidate: NonNullable<
+    ReturnType<typeof publishableFacts>["candidate"]["value"]
+  >,
+): GitWorkspace {
+  return {
+    readWorkspace: async () => ({
+      status: "ready" as const,
+      value: {
+        status: "ready" as const,
+        integrationHeadOid: oid("integration-1"),
+        candidate,
+        retainedCommitOids: [oid("integration-1")],
+        requiredParentOids: [],
+      },
+    }),
+    writeIntegrationCandidate: async () => ({
+      kind: "succeeded",
+      value: { status: "ready" },
+    }),
+    readFinalMainPostconditions: async () => ({ status: "pending" }),
+  };
+}
 
 describe("L4 publisher gates", () => {
   test.each(["changesRequested", "dismissed"] as const)(
     "does not publish a domain-confirmed Card while provider review is %s",
     async (state) => {
       const facts = publishableFacts();
+      const candidate = facts.candidate.value;
+      if (!candidate) throw new Error("candidate is required");
       facts.eligibility.reviews.value = [
         {
           pullRequestNumber: 2,
@@ -123,7 +136,7 @@ describe("L4 publisher gates", () => {
       const outcome = await createReconciler({
         candidatePolicy: testCandidatePolicy,
         github: github.value,
-        git: workspace,
+        git: workspace(candidate),
       }).reconcile({
         budget: { maxEffects: 1 },
       });
@@ -135,6 +148,8 @@ describe("L4 publisher gates", () => {
 
   test("does not publish when its confirmation no longer matches the current Card blob", async () => {
     const facts = publishableFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const [confirmation] = facts.confirmations;
     if (!confirmation) throw new Error("stability confirmation is required");
     facts.confirmations = [
@@ -145,7 +160,7 @@ describe("L4 publisher gates", () => {
     const outcome = await createReconciler({
       candidatePolicy: testCandidatePolicy,
       github: github.value,
-      git: workspace,
+      git: workspace(candidate),
     }).reconcile({
       budget: { maxEffects: 1 },
     });
@@ -156,6 +171,8 @@ describe("L4 publisher gates", () => {
 
   test("does not publish an old ready candidate after the Integration head changes", async () => {
     const facts = publishableFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const integration = facts.integrationPullRequest.value;
     if (!integration) throw new Error("stability Integration PR is required");
     facts.integrationPullRequest.value = {
@@ -168,7 +185,7 @@ describe("L4 publisher gates", () => {
     const outcome = await createReconciler({
       candidatePolicy: testCandidatePolicy,
       github: github.value,
-      git: workspace,
+      git: workspace(candidate),
     }).reconcile({
       budget: { maxEffects: 1 },
     });
@@ -181,6 +198,8 @@ describe("L4 publisher gates", () => {
 
   test("returns retryable when a base-current provider gate rejects publication", async () => {
     const facts = publishableFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const github = platform(facts);
     github.mergePullRequest.mockImplementation(
       async () =>
@@ -196,7 +215,7 @@ describe("L4 publisher gates", () => {
     await expect(
       createReconciler({
         github: github.value,
-        git: workspace,
+        git: workspace(candidate),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({
         budget: { maxEffects: 1 },

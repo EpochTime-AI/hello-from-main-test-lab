@@ -92,6 +92,7 @@ function platform(facts: ReturnType<typeof readyFacts>) {
 function workspace(input: {
   write?: ReturnType<typeof vi.fn>;
   final?: ReturnType<typeof vi.fn>;
+  candidate?: NonNullable<ReturnType<typeof readyFacts>["candidate"]["value"]>;
 }): GitWorkspace {
   return {
     readWorkspace: async () => ({
@@ -99,6 +100,7 @@ function workspace(input: {
       value: {
         status: "ready",
         integrationHeadOid: oid("integration-1"),
+        ...(input.candidate ? { candidate: input.candidate } : {}),
         retainedCommitOids: [oid("integration-1")],
         requiredParentOids: [],
       },
@@ -117,6 +119,8 @@ function workspace(input: {
 describe("L4 H2 and final publication pipeline", () => {
   test("refreshes H2 with the confirmed Card blob when main moved after Confirmation", async () => {
     const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const main = facts.main.value;
     if (!main) throw new Error("fixture main is required");
     facts.main.value = { ...main, oid: oid("main-2") };
@@ -125,7 +129,7 @@ describe("L4 H2 and final publication pipeline", () => {
 
     await createReconciler({
       github: local.github,
-      git: workspace({ write: writes }),
+      git: workspace({ write: writes, candidate }),
       candidatePolicy: testCandidatePolicy,
     }).reconcile({ budget: { maxEffects: 1 } });
 
@@ -142,13 +146,15 @@ describe("L4 H2 and final publication pipeline", () => {
 
   test("does not report publication without final-main readback", async () => {
     const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const local = platform(facts);
     const final = vi.fn(async () => ({ status: "pending" as const }));
 
     await expect(
       createReconciler({
         github: local.github,
-        git: workspace({ final }),
+        git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "pending" });
@@ -170,7 +176,7 @@ describe("L4 H2 and final publication pipeline", () => {
     await expect(
       createReconciler({
         github: local.github,
-        git: workspace({}),
+        git: workspace({ candidate: withoutHistory }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "incomplete" });
@@ -179,6 +185,8 @@ describe("L4 H2 and final publication pipeline", () => {
 
   test("returns retryable when final main does not match the required Card and history", async () => {
     const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
     const local = platform(facts);
     const final = vi.fn(async () => ({
       status: "ready" as const,
@@ -199,7 +207,7 @@ describe("L4 H2 and final publication pipeline", () => {
     await expect(
       createReconciler({
         github: local.github,
-        git: workspace({ final }),
+        git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "retryable", reason: "stalePrecondition" });
@@ -257,7 +265,7 @@ describe("L4 H2 and final publication pipeline", () => {
     await expect(
       createReconciler({
         github: local.github,
-        git: workspace({ final }),
+        git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "quiescent" });

@@ -131,7 +131,18 @@ export function validateIntake(
     }
   }
   const branchHead = facts.integrationBranch.value?.headOid;
-  if (branchHead && source && source.baseOid !== branchHead)
+  const ancestry = facts.sourceHeadBasedOnIntegration;
+  if (
+    branchHead &&
+    source &&
+    !source.merged &&
+    (source.baseOid !== branchHead ||
+      ancestry?.status !== "ready" ||
+      !ancestry.value ||
+      ancestry.value.integrationHeadOid !== branchHead ||
+      ancestry.value.sourceHeadOid !== source.headOid ||
+      ancestry.value.isAncestor !== true)
+  )
     issues.push({ category: "integration-base-or-ancestry" });
   return issues.length > 0
     ? {
@@ -389,9 +400,14 @@ function deriveEffect(
   if (!integration && facts.integrationPullRequest.status === "absent")
     return { kind: "createIntegrationPr", branchName };
   if (!branchHeadOid || !integration) return undefined;
-  if (source.baseOid !== branchHeadOid) {
+  if (!source.merged && source.baseOid !== branchHeadOid) {
     return { kind: "retarget", pullRequestNumber: source.number, branchName };
   }
+  if (
+    facts.sourceHeadBasedOnIntegration?.status !== "ready" ||
+    !facts.sourceHeadBasedOnIntegration.value
+  )
+    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (
     commentsSupported &&
     (!source.authorGithubId || !facts.trustedCommentOwner)
@@ -459,6 +475,7 @@ function deriveEffect(
   if (!workspace.retainedCommitOids || !workspace.requiredParentOids)
     return awaitingIncomplete();
   const candidate = facts.candidate.value;
+  const durableCandidate = workspace.candidate;
   const confirmation = facts.confirmations.find(
     (item) =>
       item.contributorLogin === source.authorLogin &&
@@ -482,10 +499,10 @@ function deriveEffect(
   if (
     facts.acceptedCard &&
     (workspace.integrationHeadOid || branchHeadOid) &&
-    (!candidate ||
-      candidate.mainOid !== main.oid ||
-      candidate.integrationHeadOid !== integration.headOid ||
-      candidate.cardBlobOid !== gitBlobOid(facts.acceptedCard.bytes))
+    (!durableCandidate ||
+      durableCandidate.mainOid !== main.oid ||
+      durableCandidate.integrationHeadOid !== integration.headOid ||
+      durableCandidate.cardBlobOid !== gitBlobOid(facts.acceptedCard.bytes))
   ) {
     const card = facts.acceptedCard;
     if (!workspace.retainedCommitOids || !workspace.requiredParentOids)
@@ -557,12 +574,12 @@ function deriveEffect(
             retainCommitOids: [
               ...new Set([
                 ...workspace.retainedCommitOids,
-                ...(candidate?.retainedCommitOids ?? []),
+                ...(durableCandidate?.retainedCommitOids ?? []),
                 oid(workspace.integrationHeadOid ?? branchHeadOid),
               ]),
             ],
             requiredParentOids:
-              candidate && candidate.mainOid !== main.oid
+              durableCandidate && durableCandidate.mainOid !== main.oid
                 ? []
                 : [oid(workspace.integrationHeadOid ?? branchHeadOid)],
           },
@@ -571,13 +588,13 @@ function deriveEffect(
     };
   }
   if (
-    candidate &&
+    durableCandidate &&
     integration?.draft &&
-    candidate.integrationHeadOid === integration.headOid
+    durableCandidate.integrationHeadOid === integration.headOid
   ) {
     if (
-      !candidate.retainedCommitOids ||
-      !candidate.requiredParentOids ||
+      !durableCandidate.retainedCommitOids ||
+      !durableCandidate.requiredParentOids ||
       !workspace.retainedCommitOids ||
       !workspace.requiredParentOids
     )
@@ -585,13 +602,13 @@ function deriveEffect(
     return {
       kind: "ready",
       pullRequestNumber: integration.number,
-      candidateHeadOid: candidate.integrationHeadOid,
+      candidateHeadOid: durableCandidate.integrationHeadOid,
     };
   }
   if (
-    candidate &&
+    durableCandidate &&
     !integration?.draft &&
-    candidate.integrationHeadOid === integration.headOid
+    durableCandidate.integrationHeadOid === integration.headOid
   ) {
     const readyComment = commentsSupported
       ? commentEffect(
@@ -603,9 +620,9 @@ function deriveEffect(
             runIdentity: runIdentity(source),
             originalContributor: source.authorLogin ?? "",
             integrationPullRequestNumber: integration.number,
-            candidateHeadOid: candidate.integrationHeadOid,
-            cardPath: candidate.cardPath,
-            cardBlobOid: candidate.cardBlobOid,
+            candidateHeadOid: durableCandidate.integrationHeadOid,
+            cardPath: durableCandidate.cardPath,
+            cardBlobOid: durableCandidate.cardBlobOid,
           }),
         )
       : undefined;
@@ -614,13 +631,13 @@ function deriveEffect(
   if (
     confirmation &&
     integration &&
-    candidate &&
-    candidate.integrationHeadOid === integration.headOid &&
+    durableCandidate &&
+    durableCandidate.integrationHeadOid === integration.headOid &&
     providerEligible(facts, integration.number, integration.headOid)
   ) {
     if (
-      !candidate.retainedCommitOids ||
-      !candidate.requiredParentOids ||
+      !durableCandidate.retainedCommitOids ||
+      !durableCandidate.requiredParentOids ||
       !workspace.retainedCommitOids ||
       !workspace.requiredParentOids ||
       !main.readmeBytes ||
@@ -642,21 +659,24 @@ function deriveEffect(
       expectedFinalMain: {
         mainOid: integration.headOid,
         cardManifest: {
-          path: candidate.cardPath,
-          blobOid: candidate.cardBlobOid,
+          path: durableCandidate.cardPath,
+          blobOid: durableCandidate.cardBlobOid,
           githubId: confirmation.githubId,
           sourcePrNumber: confirmation.sourcePrNumber,
         },
-        readmeBytes: candidate.readmeBytes ?? main.readmeBytes,
-        retainedCommitOids: candidate.retainedCommitOids,
-        requiredParentOids: [main.oid, candidate.integrationHeadOid],
+        readmeBytes: durableCandidate.readmeBytes ?? main.readmeBytes,
+        retainedCommitOids: durableCandidate.retainedCommitOids,
+        requiredParentOids: [main.oid, durableCandidate.integrationHeadOid],
         sourceMergeCommitOid: source.mergeCommitOid,
         integrationMergeCommitOid: integration.headOid,
         contributionMergeParentOids: [
           facts.protocolAnchors.contribution.projectShellOid,
           facts.protocolAnchors.contribution.rebasedContributorOid,
         ],
-        integrationMergeParentOids: [main.oid, candidate.integrationHeadOid],
+        integrationMergeParentOids: [
+          main.oid,
+          durableCandidate.integrationHeadOid,
+        ],
       },
     };
   }
@@ -1047,6 +1067,16 @@ function completionEffect(
 
 function awaitingIncomplete(): ReconcileOutcome {
   return { kind: "awaitingExternalFact", reason: "incomplete" };
+}
+
+function sourceAncestryOutcome(
+  status: Observation<unknown>["status"] | undefined,
+): ReconcileOutcome {
+  if (status === "readFailed")
+    return { kind: "retryable", reason: "retryableTransport" };
+  if (status === "notVisibleYet")
+    return { kind: "awaitingExternalFact", reason: "notVisibleYet" };
+  return awaitingIncomplete();
 }
 
 function candidateWriteOutcome(

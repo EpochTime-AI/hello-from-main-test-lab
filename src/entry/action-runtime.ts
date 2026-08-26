@@ -1,6 +1,7 @@
 import { createTrustedActionContext } from "../adapters/action-context.js";
 import {
   createGitRunner,
+  GitCommandError,
   installGitAuthentication,
   RealGitWorkspace,
 } from "../adapters/git.js";
@@ -39,17 +40,28 @@ export async function runTrustedAction(): Promise<void> {
   const runtimeIdentity = resolveRuntimeIdentity(process.env);
   const apiOrigin = runtimeIdentity.apiOrigin;
   const transport = createGithubTransport(token, apiOrigin);
-  const anchors =
+  const discovery =
     context.eventName === "schedule"
-      ? await discoverActiveRunAnchors({ owner, repo, transport })
-      : [
-          {
-            sourcePullRequestNumber: Number(
-              process.env.HELLO_FROM_MAIN_SOURCE_PR_NUMBER,
-            ),
-            sourceLogin: process.env.HELLO_FROM_MAIN_SOURCE_LOGIN ?? "",
-          },
-        ];
+      ? await discoverActiveRunAnchors({
+          owner,
+          repo,
+          transport,
+          apiOrigin,
+        })
+      : {
+          kind: "ready" as const,
+          anchors: [
+            {
+              sourcePullRequestNumber: Number(
+                process.env.HELLO_FROM_MAIN_SOURCE_PR_NUMBER,
+              ),
+              sourceLogin: process.env.HELLO_FROM_MAIN_SOURCE_LOGIN ?? "",
+            },
+          ],
+        };
+  if (discovery.kind !== "ready")
+    throw new Error(`watchdog discovery incomplete: ${discovery.reason}`);
+  const anchors = discovery.anchors;
   if (anchors.length === 0) return;
   for (const anchor of anchors) {
     const runtime = deriveIntegrationRuntimeConfig({
@@ -328,14 +340,23 @@ function bindProductionSetup(
         return anchor.kind === "permissionDenied" || anchor.kind === "notFound"
           ? anchor
           : { kind: "alreadyApplied", value: result };
-      } catch {
+      } catch (error) {
         return {
           kind: "retryableTransport",
-          detail: "Project Shell setup did not complete",
+          detail: gitFailureDetail(error),
         };
       }
     },
   };
+}
+
+export function gitFailureDetail(error: unknown): string {
+  if (!(error instanceof GitCommandError))
+    return "Project Shell setup failed: operation=unknown";
+  const operation = error.result.argv[0] ?? "unknown";
+  const category =
+    error.result.status === 128 ? "repository-or-auth" : "command-failed";
+  return `Project Shell setup failed: operation=${operation}; status=${error.result.status}; category=${category}`;
 }
 
 async function runFixtureComposition(): Promise<void> {
