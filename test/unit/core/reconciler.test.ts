@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type {
+  CommentIntent,
   ContributionMergeRequest,
   ContributionMergeResult,
   IntegrationMergeRequest,
@@ -13,6 +14,7 @@ import {
 } from "../../../src/core/reconciler.js";
 import type { GitWorkspace } from "../../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../../src/ports/github-platform.js";
+import { renderValidationComment } from "../../../src/render/comment.js";
 import {
   readyWorkspace,
   stabilityFacts,
@@ -425,6 +427,80 @@ describe("production reconciler boundary", () => {
       kind: "awaitingExternalFact",
       reason: "incomplete",
     });
+  });
+
+  test("updates stale validation success before planning the contribution merge", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    const oldValidation = renderValidationComment({
+      runIdentity: "source:1:7",
+      sourcePullRequestNumber: source.number,
+      sourceHeadOid: oid("old-source"),
+      result: { kind: "valid", headOid: oid("old-source") },
+    });
+    facts.comments = [
+      {
+        id: 1,
+        targetPullRequestNumber: source.number,
+        user: { id: "42", actorType: "Bot" },
+        ownerPrincipal: { actorId: "42", actorType: "Bot" },
+        actionKey: oldValidation.actionKey,
+        body: oldValidation.body,
+      },
+    ];
+    const effects: string[] = [];
+    const github = {
+      observeRepository: async () => ({
+        status: "ready" as const,
+        value: facts,
+      }),
+      ensureComment: async (intent: CommentIntent) => {
+        effects.push(`${intent.phase}:${intent.body}`);
+        facts.comments = [
+          {
+            id: 1,
+            targetPullRequestNumber: intent.targetPullRequestNumber,
+            user: { id: "42", actorType: "Bot" },
+            ownerPrincipal: { actorId: "42", actorType: "Bot" },
+            actionKey: intent.actionKey,
+            body: intent.body,
+          },
+        ];
+        return {
+          kind: "updated" as const,
+          comment: facts.comments[0],
+        };
+      },
+      mergePullRequest: async (request: ContributionMergeRequest) => {
+        effects.push(`merge:${request.expectedHeadOid}`);
+        return {
+          kind: "contributionMerged" as const,
+          headOid: oid("merged"),
+        };
+      },
+    } as unknown as GithubPlatform;
+
+    const reconciler = createReconciler({
+      github,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    });
+    await expect(
+      reconciler.reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({
+      kind: "budgetExhausted",
+      effects: 1,
+    });
+    await expect(
+      reconciler.reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({
+      kind: "budgetExhausted",
+      effects: 1,
+    });
+    expect(effects[0]).toMatch(/^validation-success:/u);
+    expect(effects[1]).toBe("merge:contribution-1");
   });
 
   test("rejects a candidate write whose readback does not satisfy its manifest postconditions", async () => {

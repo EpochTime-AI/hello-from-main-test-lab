@@ -2901,6 +2901,474 @@ describe("OctokitGithubPlatform", () => {
     });
   });
 
+  test("accepts the live one-page Compare payload without head_commit and first-only Link", async () => {
+    const observed = await createOctokitGithubPlatform({
+      owner: "EpochTime-AI",
+      repo: "hello-from-main-test-lab",
+      repositoryId: 1346809298,
+      transport: liveCompareTransport([
+        {
+          status: 200,
+          data: {
+            status: "ahead",
+            base_commit: {
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+            merge_base_commit: {
+              sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+            },
+            total_commits: 1,
+            commits: [
+              {
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                parents: [{ sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" }],
+              },
+            ],
+          },
+          headers: {
+            link: '<https://api.github.com/repositories/1346809298/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="first"',
+          },
+        },
+      ]),
+    }).observeRepository();
+
+    expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: {
+        integrationHeadOid: oid("acad22238c3b830352b8ac722da9c6ba1751b7dd"),
+        sourceHeadOid: oid("1ce6aff2da2284107da36d4ecf5bebd647e18c4b"),
+        isAncestor: true,
+      },
+    });
+  });
+
+  test("proves an absent Compare head from the final aggregated ahead commit", async () => {
+    const pages = [
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "intermediate" }],
+        },
+        headers: {
+          link: '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+        },
+      },
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+        },
+      },
+    ];
+    const observed = await createOctokitGithubPlatform({
+      owner: "EpochTime-AI",
+      repo: "hello-from-main-test-lab",
+      repositoryId: 1346809298,
+      transport: liveCompareTransport(pages),
+    }).observeRepository();
+
+    expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: { isAncestor: true },
+    });
+  });
+
+  test("rejects absent-head Compare proofs that do not match the requested status", async () => {
+    const cases = [
+      {
+        status: "ahead",
+        total_commits: 1,
+        commits: [{ sha: "not-the-requested-source" }],
+      },
+      { status: "identical", total_commits: 1, commits: [] },
+      { status: "behind", total_commits: 0, commits: [] },
+      { status: "diverged", total_commits: 0, commits: [] },
+    ] as const;
+
+    for (const compare of cases) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              ...compare,
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("keeps present-head behind and diverged Compare facts complete but non-ancestral", async () => {
+    for (const status of ["behind", "diverged"] as const) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status,
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              head_commit: {
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 0,
+              commits: [],
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+        value: {
+          sourceHeadOid: oid("1ce6aff2da2284107da36d4ecf5bebd647e18c4b"),
+          isAncestor: false,
+        },
+      });
+    }
+  });
+
+  test("requires identical Compare results to bind equal requested OIDs with zero commits", async () => {
+    for (const compare of [
+      {
+        base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        head_commit: { sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" },
+        total_commits: 0,
+        commits: [],
+      },
+      {
+        base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        head_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+        total_commits: 1,
+        commits: [{ sha: "unexpected" }],
+      },
+    ]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "identical",
+              ...compare,
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("rejects a present malformed or mismatched Compare head_commit", async () => {
+    for (const head_commit of [{}, { sha: "wrong-source" }]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              head_commit,
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 1,
+              commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+            },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("treats syntactically valid Compare Link headers without next as terminal", async () => {
+    for (const link of [
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="first"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="prev", <https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="last"',
+    ]) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 1,
+              commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+            },
+            headers: { link },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+      });
+    }
+  });
+
+  test("rejects malformed, duplicate, wrong, looping, and nonprogressing Compare next links", async () => {
+    const links = [
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next", broken',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next", <https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=3>; rel="next"',
+      '<https://attacker.invalid/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/other/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=50&page=2>; rel="next"',
+      '<https://api.github.com/repos/EpochTime-AI/hello-from-main-test-lab/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b?per_page=100&page=1>; rel="next"',
+    ];
+
+    for (const link of links) {
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        transport: liveCompareTransport([
+          {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              merge_base_commit: {
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              total_commits: 2,
+              commits: [{ sha: "intermediate" }],
+            },
+            headers: { link },
+          },
+        ]),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+    }
+  });
+
+  test("follows canonical and numeric GHES Compare links with the /api/v3 prefix exactly once", async () => {
+    const comparePath =
+      "/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b";
+    const pages = [
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          head_commit: {
+            sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+          },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "intermediate" }],
+        },
+      },
+      {
+        status: 200,
+        data: {
+          status: "ahead",
+          base_commit: { sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd" },
+          head_commit: {
+            sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+          },
+          merge_base_commit: {
+            sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+          },
+          total_commits: 2,
+          commits: [{ sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b" }],
+        },
+      },
+    ];
+    for (const linkPath of [
+      `/api/v3/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/api/v3/repositories/1346809298${comparePath}`,
+    ]) {
+      const requests: string[] = [];
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        apiOrigin: "https://ghe.example/api/v3",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport(
+          pages.map((page, index) =>
+            index === 0
+              ? {
+                  ...page,
+                  headers: {
+                    link: `<https://ghe.example${linkPath}?per_page=100&page=2>; rel="next"`,
+                  },
+                }
+              : page,
+          ),
+          (request) => requests.push(request.path),
+        ),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "ready",
+        value: { isAncestor: true },
+      });
+      const expectedFollowUpPath = linkPath.includes("/repositories/")
+        ? `/repositories/1346809298${comparePath}?per_page=100&page=2`
+        : `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}?per_page=100&page=2`;
+      expect(requests.filter((path) => path.includes("/compare/"))).toEqual([
+        `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+        expectedFollowUpPath,
+      ]);
+      expect(
+        requests
+          .filter((path) => path.includes("/compare/"))
+          .every((path) => !path.includes("/api/v3/")),
+      ).toBe(true);
+    }
+  });
+
+  test("adds the GHES API prefix exactly once when transporting Compare follow-up paths", async () => {
+    const originalFetch = globalThis.fetch;
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({}), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const transport = createGithubTransport(
+        "token",
+        "https://ghe.example/api/v3",
+      );
+      await transport.rest({
+        method: "GET",
+        path: "/repositories/1346809298/compare/base...head",
+        parameters: { per_page: 100, page: 2 },
+      });
+      await transport.rest({
+        method: "GET",
+        path: "/repos/acme/hello/compare/base...head",
+        parameters: { per_page: 100, page: 2 },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(urls).toEqual([
+      "https://ghe.example/api/v3/repositories/1346809298/compare/base...head?per_page=100&page=2",
+      "https://ghe.example/api/v3/repos/acme/hello/compare/base...head?per_page=100&page=2",
+    ]);
+    expect(urls.every((url) => url.match(/\/api\/v3/g)?.length === 1)).toBe(
+      true,
+    );
+  });
+
+  test("rejects GHES Compare links with a missing or wrong API prefix", async () => {
+    const comparePath =
+      "/compare/acad22238c3b830352b8ac722da9c6ba1751b7dd...1ce6aff2da2284107da36d4ecf5bebd647e18c4b";
+    for (const linkPath of [
+      `/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/repositories/1346809298${comparePath}`,
+      `/api/v2/repos/EpochTime-AI/hello-from-main-test-lab${comparePath}`,
+      `/api/v2/repositories/1346809298${comparePath}`,
+    ]) {
+      const requests: string[] = [];
+      const observed = await createOctokitGithubPlatform({
+        owner: "EpochTime-AI",
+        repo: "hello-from-main-test-lab",
+        apiOrigin: "https://ghe.example/api/v3",
+        repositoryId: 1346809298,
+        transport: liveCompareTransport(
+          [
+            {
+              status: 200,
+              data: {
+                status: "ahead",
+                base_commit: {
+                  sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+                },
+                head_commit: {
+                  sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                },
+                merge_base_commit: {
+                  sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+                },
+                total_commits: 2,
+                commits: [{ sha: "intermediate" }],
+              },
+              headers: {
+                link: `<https://ghe.example${linkPath}?per_page=100&page=2>; rel="next"`,
+              },
+            },
+          ],
+          (request) => requests.push(request.path),
+        ),
+      }).observeRepository();
+
+      expect(observed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+        status: "incomplete",
+      });
+      expect(
+        requests.filter((path) => path.includes("/compare/")),
+      ).toHaveLength(1);
+    }
+  });
+
   test("accepts canonical string source and active identities without numeric coercion", async () => {
     const platform = createOctokitGithubPlatform({
       owner: "acme",
@@ -2986,6 +3454,117 @@ function identityObservationTransport(
           },
         };
       throw new Error(`unexpected ${request.path}`);
+    },
+    graphql: async () => ({ data: {} }),
+  };
+}
+
+function liveCompareTransport(
+  comparePages: readonly {
+    status: number;
+    data: unknown;
+    headers?: Record<string, string>;
+  }[],
+  onRequest?: (request: { method: string; path: string }) => void,
+): OctokitRequestTransport {
+  let comparePage = 0;
+  return {
+    rest: async (request) => {
+      onRequest?.(request);
+      if (request.path.endsWith("/git/ref/heads/main"))
+        return { status: 200, data: { object: { sha: "main" } } };
+      if (request.path.endsWith("/pulls"))
+        return {
+          status: 200,
+          data: [
+            {
+              number: 1,
+              state: "open",
+              draft: false,
+              user: { login: "c-w-xiaohei", id: 88074703 },
+              head: {
+                ref: "add/c-w-xiaohei",
+                sha: "1ce6aff2da2284107da36d4ecf5bebd647e18c4b",
+                repo: { fork: true, owner: { login: "c-w-xiaohei" } },
+              },
+              base: {
+                ref: "feature/card-c-w-xiaohei-source-1",
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+            },
+            {
+              number: 2,
+              state: "open",
+              draft: true,
+              head: {
+                ref: "feature/card-c-w-xiaohei-source-1",
+                sha: "acad22238c3b830352b8ac722da9c6ba1751b7dd",
+              },
+              base: { ref: "main", sha: "main" },
+            },
+          ],
+        };
+      if (request.path.includes("/compare/")) {
+        const page = comparePages[comparePage];
+        if (!page) throw new Error("unexpected Compare page");
+        comparePage += 1;
+        return page;
+      }
+      if (request.path.endsWith("/pulls/1/files"))
+        return {
+          status: 200,
+          data: [
+            {
+              filename: "people/c-w-xiaohei.md",
+              sha: "94537e81de442e570daccef4b96267b06145cb6d",
+            },
+          ],
+        };
+      if (request.path.endsWith("/git/trees/main"))
+        return {
+          status: 200,
+          data: { tree: [{ path: "README.md", type: "blob", sha: "readme" }] },
+        };
+      if (
+        request.path.endsWith(
+          "/git/trees/acad22238c3b830352b8ac722da9c6ba1751b7dd",
+        )
+      )
+        return {
+          status: 200,
+          data: { tree: [{ path: "README.md", type: "blob", sha: "readme" }] },
+        };
+      if (request.path.endsWith("/git/blobs/readme"))
+        return {
+          status: 200,
+          data: {
+            encoding: "base64",
+            content: Buffer.from("# Hello\n").toString("base64"),
+          },
+        };
+      if (
+        request.path.endsWith(
+          "/git/blobs/94537e81de442e570daccef4b96267b06145cb6d",
+        )
+      )
+        return {
+          status: 200,
+          data: {
+            encoding: "base64",
+            content: Buffer.from(
+              "---\ngithub: c-w-xiaohei\ngithub_id: 88074703\nsource_pr: 1\n---\n\n# Card\n\n最近在折腾：Git\n\n> Hi\n",
+            ).toString("base64"),
+          },
+        };
+      if (
+        request.path.endsWith(
+          "/commits/acad22238c3b830352b8ac722da9c6ba1751b7dd/check-runs",
+        )
+      )
+        return { status: 200, data: { check_runs: [] } };
+      if (request.path.endsWith("/pulls/2/reviews"))
+        return { status: 200, data: [] };
+      throw new Error(`unexpected ${request.method} ${request.path}`);
     },
     graphql: async () => ({ data: {} }),
   };

@@ -814,13 +814,16 @@ export function createOctokitGithubPlatform(
       const comparison = asRecord(response.data);
       const status = comparison.status;
       const base = stringValue(asRecord(comparison.base_commit).sha);
-      const head = stringValue(asRecord(comparison.head_commit).sha);
+      const headCommitPresent = Object.hasOwn(comparison, "head_commit");
+      const head = headCommitPresent
+        ? stringValue(asRecord(comparison.head_commit).sha)
+        : undefined;
       const mergeBase = stringValue(asRecord(comparison.merge_base_commit).sha);
       const commits = comparison.commits;
       const totalCommits = comparison.total_commits;
       if (
         base !== integrationHeadOid ||
-        head !== sourceHeadOid ||
+        (headCommitPresent && head !== sourceHeadOid) ||
         !Array.isArray(commits) ||
         typeof totalCommits !== "number" ||
         !Number.isSafeInteger(totalCommits) ||
@@ -848,10 +851,13 @@ export function createOctokitGithubPlatform(
         return incompleteAncestry(
           "malformed source ancestry comparison commits",
         );
+      let currentPage = 1;
       let next = compareNextLink(
         response.headers?.link,
         apiOrigin,
         comparePath,
+        currentPage,
+        repositoryId,
       );
       const seenLinks = new Set<string>();
       let pages = 1;
@@ -878,10 +884,16 @@ export function createOctokitGithubPlatform(
         if (
           pageComparison.status !== status ||
           stringValue(asRecord(pageComparison.base_commit).sha) !== base ||
-          stringValue(asRecord(pageComparison.head_commit).sha) !== head ||
+          (Object.hasOwn(pageComparison, "head_commit") &&
+            stringValue(asRecord(pageComparison.head_commit).sha) !==
+              sourceHeadOid) ||
           stringValue(asRecord(pageComparison.merge_base_commit).sha) !==
             mergeBase ||
+          pageComparison.total_commits !== totalCommits ||
+          typeof pageComparison.total_commits !== "number" ||
+          !Number.isSafeInteger(pageComparison.total_commits) ||
           !Array.isArray(pageComparison.commits) ||
+          pageComparison.total_commits < pageComparison.commits.length ||
           !addCompareCommits(pageComparison.commits, commitOids)
         )
           return incompleteAncestry(
@@ -891,11 +903,30 @@ export function createOctokitGithubPlatform(
           nextResponse.headers?.link,
           apiOrigin,
           comparePath,
+          currentPage,
+          repositoryId,
         );
+        if (next !== undefined)
+          currentPage = Number(
+            new URL(`${apiOrigin.origin}${next}`).searchParams.get("page"),
+          );
       }
       if (commitOids.size !== totalCommits)
         return incompleteAncestry(
           "source ancestry comparison commit count mismatch",
+        );
+      const finalCommitOid = Array.from(commitOids).pop();
+      if (
+        (!headCommitPresent &&
+          status === "ahead" &&
+          finalCommitOid !== sourceHeadOid) ||
+        (status === "identical" &&
+          (integrationHeadOid !== sourceHeadOid || totalCommits !== 0)) ||
+        (!headCommitPresent && status !== "ahead" && status !== "identical") ||
+        (headCommitPresent && head !== sourceHeadOid)
+      )
+        return incompleteAncestry(
+          "source ancestry comparison does not prove requested source head",
         );
       return {
         status: "ready",
@@ -1724,28 +1755,78 @@ function compareNextLink(
   header: string | undefined,
   origin: URL,
   comparePath: string,
+  currentPage: number,
+  repositoryId: number | undefined,
 ): string | undefined {
-  if (!header) return undefined;
-  const matches = [...header.matchAll(/<([^>]+)>;\s*rel="([^"]+)"/gu)];
-  const next = matches.filter((match) => match[2] === "next");
-  if (next.length !== 1 || !next[0]?.[1])
+  if (header === undefined) return undefined;
+  if (header.trim().length === 0)
     throw new Error("malformed compare Link header");
-  const url = new URL(next[0][1], origin);
-  if (url.origin !== origin.origin || url.pathname !== comparePath)
-    throw new Error("untrusted compare Link header");
-  const page = url.searchParams.get("page");
-  const perPage = url.searchParams.get("per_page");
-  if (
-    !page ||
-    !perPage ||
-    !/^[1-9][0-9]*$/u.test(page) ||
-    perPage !== "100" ||
-    [...url.searchParams.keys()].some(
-      (key) => key !== "page" && key !== "per_page",
+  const entries = header.split(",").map((entry) => entry.trim());
+  if (entries.some((entry) => !/^<[^<>]+>\s*;\s*rel="[^"]+"$/u.test(entry)))
+    throw new Error("malformed compare Link header");
+  const relations = entries.map((entry) => {
+    const match = /^<([^<>]+)>\s*;\s*rel="([^"]+)"$/u.exec(entry);
+    if (!match?.[1] || !match[2])
+      throw new Error("malformed compare Link header");
+    return { url: match[1], rels: match[2].split(/\s+/u) };
+  });
+  const nextLinks = relations.flatMap((entry) =>
+    entry.rels
+      .filter((rel) => rel.toLowerCase() === "next")
+      .map(() => entry.url),
+  );
+  if (nextLinks.length > 1) throw new Error("malformed compare Link header");
+  for (const relation of relations) {
+    const url = new URL(relation.url, origin);
+    if (
+      url.origin !== origin.origin ||
+      !compareLinkPath(url.pathname, origin, comparePath, repositoryId)
     )
-  )
-    throw new Error("malformed compare Link query");
-  return `${url.pathname}?${url.searchParams.toString()}`;
+      throw new Error("untrusted compare Link header");
+    const page = url.searchParams.get("page");
+    const perPage = url.searchParams.get("per_page");
+    if (
+      !page ||
+      !perPage ||
+      !/^[1-9][0-9]*$/u.test(page) ||
+      perPage !== "100" ||
+      url.searchParams.getAll("page").length !== 1 ||
+      url.searchParams.getAll("per_page").length !== 1 ||
+      [...url.searchParams.keys()].some(
+        (key) => key !== "page" && key !== "per_page",
+      )
+    )
+      throw new Error("malformed compare Link query");
+    if (
+      relation.rels.some((rel) => rel.toLowerCase() === "next") &&
+      Number(page) <= currentPage
+    )
+      throw new Error("nonprogressing compare Link");
+  }
+  if (nextLinks.length === 0) return undefined;
+  const nextLink = nextLinks[0];
+  if (!nextLink) return undefined;
+  const url = new URL(nextLink, origin);
+  const apiPath = trustedApiPath(origin);
+  return `${url.pathname.slice(apiPath.length)}?${url.searchParams.toString()}`;
+}
+
+function compareLinkPath(
+  pathname: string,
+  origin: URL,
+  comparePath: string,
+  repositoryId: number | undefined,
+): boolean {
+  const apiPath = trustedApiPath(origin);
+  if (pathname === `${apiPath}${comparePath}`) return true;
+  if (repositoryId === undefined) return false;
+  const suffix = comparePath.match(
+    /^\/repos\/[^/]+\/[^/]+(\/compare\/.*)$/u,
+  )?.[1];
+  return (
+    suffix !== undefined &&
+    pathname === `${apiPath}/repositories/${repositoryId}${suffix}`
+  );
 }
 
 function pullRequestFact(
