@@ -9,6 +9,7 @@ import { oid } from "../../../src/core/model.js";
 import {
   createReconciler,
   validateFinalMain,
+  validateIntake,
 } from "../../../src/core/reconciler.js";
 import type { GitWorkspace } from "../../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../../src/ports/github-platform.js";
@@ -300,6 +301,17 @@ describe("production reconciler boundary", () => {
       merged: false,
       closed: false,
     };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "ready",
+      provenance: "modeled",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: oid("integration-1"),
+        isAncestor: true,
+        observedOid: oid("integration-1"),
+        provenance: "modeled",
+      },
+    };
     let merges = 0;
     const github = {
       observeRepository: async () => ({
@@ -335,6 +347,84 @@ describe("production reconciler boundary", () => {
     });
 
     expect(merges).toBe(1);
+  });
+
+  test("blocks a retargeted source head that does not contain the Integration head", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "ready",
+      provenance: "provider",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: source.headOid,
+        isAncestor: false,
+        observedOid: source.headOid,
+        provenance: "provider",
+      },
+    };
+    let merges = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        mergePullRequest: async () => {
+          merges += 1;
+          return {
+            kind: "contributionMerged" as const,
+            headOid: oid("merged"),
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(validateIntake(facts, testCandidatePolicy)).toMatchObject({
+      kind: "invalid",
+      issues: [{ category: "integration-base-or-ancestry" }],
+    });
+    expect(merges).toBe(0);
+    expect(result).toEqual({ kind: "terminal", reason: "policyRejected" });
+  });
+
+  test("awaits an unavailable source ancestry fact before validation or merge", async () => {
+    const facts = stabilityFacts();
+    const source = facts.sourcePullRequest.value;
+    if (!source) throw new Error("source is required");
+    facts.sourcePullRequest.value = { ...source, merged: false, closed: false };
+    facts.sourceHeadBasedOnIntegration = {
+      status: "incomplete",
+      provenance: "provider",
+    };
+    let merges = 0;
+    const result = await createReconciler({
+      github: {
+        observeRepository: async () => ({
+          status: "ready" as const,
+          value: facts,
+        }),
+        mergePullRequest: async () => {
+          merges += 1;
+          return {
+            kind: "contributionMerged" as const,
+            headOid: oid("merged"),
+          };
+        },
+      } as unknown as GithubPlatform,
+      git: { readWorkspace: readyWorkspace } as GitWorkspace,
+      candidatePolicy: testCandidatePolicy,
+    }).reconcile({ budget: { maxEffects: 1 } });
+
+    expect(merges).toBe(0);
+    expect(result).toEqual({
+      kind: "awaitingExternalFact",
+      reason: "incomplete",
+    });
   });
 
   test("rejects a candidate write whose readback does not satisfy its manifest postconditions", async () => {

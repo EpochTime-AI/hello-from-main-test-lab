@@ -55,13 +55,27 @@ describe("verification scripts", () => {
         new URL(`../../.github/workflows/${file}`, import.meta.url),
         "utf8",
       );
-      expect(workflow).toContain("uses: actions/checkout@v4");
+      expect(workflow).toContain(
+        "uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      );
       expect(workflow).toContain("uses: ./");
       expect(workflow).toContain("HELLO_FROM_MAIN_COMMENT_OWNER_ID");
       expect(workflow).toContain("HELLO_FROM_MAIN_COMMENT_OWNER_TYPE");
       expect(workflow).toContain("vars.HELLO_FROM_MAIN_COMMENT_OWNER_ID");
       expect(workflow).toContain("vars.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE");
     }
+  });
+
+  test("controller uses only the trusted target-event checkout boundary", async () => {
+    const workflow = await readFile(
+      new URL("../../.github/workflows/controller.yml", import.meta.url),
+      "utf8",
+    );
+    expect(workflow).toContain("pull_request_target:");
+    expect(workflow).not.toContain("pull_request:\n");
+    expect(workflow).toContain("ref: refs/heads/main");
+    expect(workflow).toContain("persist-credentials: false");
+    expect(workflow).not.toContain("github.event.pull_request.head");
   });
 
   test("rejects malformed workflow indentation", async () => {

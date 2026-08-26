@@ -1,6 +1,6 @@
 name: Hello from Main controller
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
   workflow_dispatch:
 permissions:
@@ -12,10 +12,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   controller:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.base.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.base.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ${{ github.repository }}
           ref: refs/heads/main

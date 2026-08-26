@@ -20,7 +20,7 @@ import type {
   InvocationContext,
 } from "../ports/github-platform.js";
 
-type RestMethod = "GET" | "POST" | "PATCH";
+type RestMethod = "GET" | "POST" | "PATCH" | "PUT";
 type RestRequest = {
   method: RestMethod;
   path: string;
@@ -222,6 +222,23 @@ export function createOctokitGithubPlatform(
             pullRequestFact(source, "contribution"),
           )
         : undefined;
+      const sourceHeadBasedOnIntegration = sourceFact
+        ? branch && !sourceFact.merged
+          ? await observeSourceAncestry(branch.headOid, sourceFact.headOid)
+          : sourceFact.merged
+            ? {
+                status: "ready" as const,
+                provenance: "provider" as const,
+                value: {
+                  integrationHeadOid: sourceFact.baseOid,
+                  sourceHeadOid: sourceFact.headOid,
+                  isAncestor: true,
+                  observedOid: sourceFact.headOid,
+                  provenance: "provider" as const,
+                },
+              }
+            : { status: "pending" as const, provenance: "provider" as const }
+        : undefined;
       const integrationFact = integration
         ? await hydrateMergeParents(pullRequestFact(integration, "integration"))
         : undefined;
@@ -235,6 +252,9 @@ export function createOctokitGithubPlatform(
         sourcePullRequest: sourceFact
           ? { status: "ready", provenance: "provider", value: sourceFact }
           : { status: "absent", provenance: "provider" },
+        ...(sourceHeadBasedOnIntegration
+          ? { sourceHeadBasedOnIntegration }
+          : {}),
         integrationBranch: branch
           ? { status: "ready", provenance: "provider", value: branch }
           : { status: "absent", provenance: "provider" },
@@ -726,7 +746,7 @@ export function createOctokitGithubPlatform(
     let response: RestResponse;
     try {
       response = await options.transport.rest({
-        method: "POST",
+        method: "PUT",
         path: path(`/pulls/${number}/merge`),
         parameters: { sha: expectedHeadOid, merge_method: "merge" },
       });
@@ -741,8 +761,27 @@ export function createOctokitGithubPlatform(
     }
     if (response.status === 200) {
       const data = asRecord(response.data);
-      if (data.merged === true)
-        return { kind: "merged", oid: oid(stringValue(data.sha)) };
+      const mergeOid =
+        typeof data.sha === "string" && data.sha.length > 0
+          ? oid(data.sha)
+          : undefined;
+      if (data.merged === true && mergeOid) {
+        try {
+          const readback = await requestRest(
+            { method: "GET", path: path(`/pulls/${number}`) },
+            "read",
+          );
+          const pullRequest = asRecord(readback.data);
+          if (
+            pullRequest.merged === true &&
+            asRecord(pullRequest).merge_commit_sha === mergeOid
+          )
+            return { kind: "merged", oid: mergeOid };
+        } catch {
+          return { kind: "rejected", reason: "unknownOutcome" };
+        }
+        return { kind: "rejected", reason: "stalePrecondition" };
+      }
       return { kind: "rejected", reason: "policyRejected" };
     }
     return { kind: "rejected", reason: errorCategory(response) };
@@ -754,6 +793,133 @@ export function createOctokitGithubPlatform(
       "read",
     );
     return pullRequestFact(response.data, "integration");
+  }
+
+  async function observeSourceAncestry(
+    integrationHeadOid: ReturnType<typeof oid>,
+    sourceHeadOid: ReturnType<typeof oid>,
+  ): Promise<RepositoryFacts["sourceHeadBasedOnIntegration"]> {
+    try {
+      const comparePath = path(
+        `/compare/${integrationHeadOid}...${sourceHeadOid}`,
+      );
+      const response = await requestLegacyRest(
+        {
+          method: "GET",
+          path: comparePath,
+          parameters: { per_page: 100, page: 1 },
+        },
+        "read",
+      );
+      const comparison = asRecord(response.data);
+      const status = comparison.status;
+      const base = stringValue(asRecord(comparison.base_commit).sha);
+      const head = stringValue(asRecord(comparison.head_commit).sha);
+      const mergeBase = stringValue(asRecord(comparison.merge_base_commit).sha);
+      const commits = comparison.commits;
+      const totalCommits = comparison.total_commits;
+      if (
+        base !== integrationHeadOid ||
+        head !== sourceHeadOid ||
+        !Array.isArray(commits) ||
+        typeof totalCommits !== "number" ||
+        !Number.isSafeInteger(totalCommits) ||
+        totalCommits < commits.length ||
+        (totalCommits > commits.length && !response.headers?.link)
+      )
+        return {
+          status: "incomplete",
+          provenance: "provider",
+          error: "incomplete or malformed source ancestry comparison",
+        };
+      if (
+        status !== "ahead" &&
+        status !== "identical" &&
+        status !== "behind" &&
+        status !== "diverged"
+      )
+        return {
+          status: "incomplete",
+          provenance: "provider",
+          error: "unknown source ancestry comparison status",
+        };
+      const commitOids = new Set<string>();
+      if (!addCompareCommits(commits, commitOids))
+        return incompleteAncestry(
+          "malformed source ancestry comparison commits",
+        );
+      let next = compareNextLink(
+        response.headers?.link,
+        apiOrigin,
+        comparePath,
+      );
+      const seenLinks = new Set<string>();
+      let pages = 1;
+      while (next !== undefined) {
+        if (seenLinks.has(next))
+          return incompleteAncestry(
+            "source ancestry comparison pagination loop",
+          );
+        seenLinks.add(next);
+        if (++pages > 100)
+          return {
+            status: "incomplete",
+            provenance: "provider",
+            error: "source ancestry comparison pagination exceeded budget",
+          };
+        const nextResponse = await requestLegacyRest(
+          {
+            method: "GET",
+            path: next,
+          },
+          "read",
+        );
+        const pageComparison = asRecord(nextResponse.data);
+        if (
+          pageComparison.status !== status ||
+          stringValue(asRecord(pageComparison.base_commit).sha) !== base ||
+          stringValue(asRecord(pageComparison.head_commit).sha) !== head ||
+          stringValue(asRecord(pageComparison.merge_base_commit).sha) !==
+            mergeBase ||
+          !Array.isArray(pageComparison.commits) ||
+          !addCompareCommits(pageComparison.commits, commitOids)
+        )
+          return incompleteAncestry(
+            "malformed source ancestry comparison page",
+          );
+        next = compareNextLink(
+          nextResponse.headers?.link,
+          apiOrigin,
+          comparePath,
+        );
+      }
+      if (commitOids.size !== totalCommits)
+        return incompleteAncestry(
+          "source ancestry comparison commit count mismatch",
+        );
+      return {
+        status: "ready",
+        provenance: "provider",
+        value: {
+          integrationHeadOid,
+          sourceHeadOid,
+          isAncestor:
+            (status === "ahead" || status === "identical") &&
+            mergeBase === integrationHeadOid,
+          observedOid: sourceHeadOid,
+          provenance: "provider",
+        },
+      };
+    } catch (error) {
+      return {
+        status: "incomplete",
+        provenance: "provider",
+        error:
+          error instanceof Error
+            ? error.message
+            : "source ancestry read failed",
+      };
+    }
   }
 
   async function readMainProjection(mainOid: ReturnType<typeof oid>) {
@@ -1538,6 +1704,50 @@ function legacyNextPage(response: RestResponse): number | undefined {
     : undefined;
 }
 
+function incompleteAncestry(
+  error: string,
+): RepositoryFacts["sourceHeadBasedOnIntegration"] {
+  return { status: "incomplete", provenance: "provider", error };
+}
+
+function addCompareCommits(commits: unknown[], seen: Set<string>): boolean {
+  for (const item of commits) {
+    const sha = asRecord(item).sha;
+    if (typeof sha !== "string" || sha.length === 0 || seen.has(sha))
+      return false;
+    seen.add(sha);
+  }
+  return true;
+}
+
+function compareNextLink(
+  header: string | undefined,
+  origin: URL,
+  comparePath: string,
+): string | undefined {
+  if (!header) return undefined;
+  const matches = [...header.matchAll(/<([^>]+)>;\s*rel="([^"]+)"/gu)];
+  const next = matches.filter((match) => match[2] === "next");
+  if (next.length !== 1 || !next[0]?.[1])
+    throw new Error("malformed compare Link header");
+  const url = new URL(next[0][1], origin);
+  if (url.origin !== origin.origin || url.pathname !== comparePath)
+    throw new Error("untrusted compare Link header");
+  const page = url.searchParams.get("page");
+  const perPage = url.searchParams.get("per_page");
+  if (
+    !page ||
+    !perPage ||
+    !/^[1-9][0-9]*$/u.test(page) ||
+    perPage !== "100" ||
+    [...url.searchParams.keys()].some(
+      (key) => key !== "page" && key !== "per_page",
+    )
+  )
+    throw new Error("malformed compare Link query");
+  return `${url.pathname}?${url.searchParams.toString()}`;
+}
+
 function pullRequestFact(
   value: unknown,
   kind: "contribution" | "integration",
@@ -1694,6 +1904,7 @@ function errorCategory(
       : "notFound";
   }
   if (response.status === 409) return "stalePrecondition";
+  if (response.status === 405) return "policyRejected";
   if (response.status === 422) return "policyRejected";
   if (response.status === 429) return "rateLimited";
   return response.status >= 500 ? "retryableTransport" : "unknownOutcome";

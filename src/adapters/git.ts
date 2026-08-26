@@ -786,6 +786,39 @@ export class RealGitWorkspace {
     );
     return { mergeCommitOid, parents };
   }
+
+  async isAncestor(
+    ancestor: Oid,
+    descendant: string,
+    expectedSourceOid: Oid,
+  ): Promise<{ isAncestor: boolean; sourceHeadOid: Oid }> {
+    const remote = descendant.split("/", 1)[0];
+    let resolvedDescendant = descendant;
+    if (remote && descendant.includes("/"))
+      await git(
+        this.runner,
+        this.cwd,
+        "fetch",
+        remote,
+        descendant.slice(remote.length + 1),
+      ).then(() => {
+        resolvedDescendant = "FETCH_HEAD";
+      });
+    const sourceHeadOid = oid(
+      await git(this.runner, this.cwd, "rev-parse", resolvedDescendant),
+    );
+    if (sourceHeadOid !== expectedSourceOid)
+      return { isAncestor: false, sourceHeadOid };
+    return {
+      isAncestor: await isAncestor(
+        this.runner,
+        this.cwd,
+        ancestor,
+        sourceHeadOid,
+      ),
+      sourceHeadOid,
+    };
+  }
 }
 
 function oidFromBytes(bytes: Uint8Array): Oid {

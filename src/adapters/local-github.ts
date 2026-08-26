@@ -46,6 +46,14 @@ type MergeWorkspace = Pick<GitWorkspace, "readWorkspace"> &
       mergeCommitOid: ReturnType<typeof oid>;
       parents: readonly ReturnType<typeof oid>[];
     }>;
+    isAncestor?: (
+      ancestor: ReturnType<typeof oid>,
+      descendant: string,
+      expectedSourceOid: ReturnType<typeof oid>,
+    ) => Promise<{
+      isAncestor: boolean;
+      sourceHeadOid: ReturnType<typeof oid>;
+    }>;
   };
 
 export type LocalGithubPlatformOptions = {
@@ -588,6 +596,43 @@ export function createLocalGithubPlatform(
         };
       }
       const source = state.sourcePullRequest.value;
+      const branch = state.integrationBranch.value;
+      const ancestryWorkspace =
+        options.contributionWorkspace ?? options.workspace;
+      if (source && branch && !source.merged && ancestryWorkspace.isAncestor) {
+        try {
+          const ancestry = await ancestryWorkspace.isAncestor(
+            branch.headOid,
+            options.refs.contribution,
+            source.headOid,
+          );
+          if (ancestry.sourceHeadOid !== source.headOid)
+            throw new Error("source ref moved during ancestry observation");
+          state = {
+            ...state,
+            sourceHeadBasedOnIntegration: {
+              status: "ready",
+              provenance: "observed",
+              value: {
+                integrationHeadOid: branch.headOid,
+                sourceHeadOid: source.headOid,
+                isAncestor: ancestry.isAncestor,
+                observedOid: source.headOid,
+                provenance: "observed",
+              },
+            },
+          };
+        } catch {
+          state = {
+            ...state,
+            sourceHeadBasedOnIntegration: {
+              status: "incomplete",
+              provenance: "observed",
+              error: "local source ancestry could not be read",
+            },
+          };
+        }
+      }
       const accepted = source?.merged ? source.changedFiles?.[0] : undefined;
       if (
         source?.authorGithubId &&
@@ -1042,6 +1087,7 @@ function decodeRepositoryFacts(value: unknown): RepositoryFacts {
     [
       "main",
       "sourcePullRequest",
+      "sourceHeadBasedOnIntegration",
       "integrationBranch",
       "integrationPullRequest",
       "candidate",
@@ -1069,6 +1115,14 @@ function decodeRepositoryFacts(value: unknown): RepositoryFacts {
       record.sourcePullRequest,
       decodePullRequest,
     ),
+    ...(record.sourceHeadBasedOnIntegration !== undefined
+      ? {
+          sourceHeadBasedOnIntegration: decodeObservation(
+            record.sourceHeadBasedOnIntegration,
+            decodeSourceHeadAncestry,
+          ),
+        }
+      : {}),
     integrationBranch: decodeObservation(
       record.integrationBranch,
       decodeBranch,
@@ -1286,6 +1340,38 @@ function decodeBranch(value: unknown): BranchAnchor {
       record.provenance,
       ["provider", "modeled", "observed", "derived"] as const,
       "branch.provenance",
+    ),
+  };
+}
+
+function decodeSourceHeadAncestry(value: unknown) {
+  const record = object(value, "source head ancestry");
+  assertKeys(
+    record,
+    [
+      "integrationHeadOid",
+      "sourceHeadOid",
+      "isAncestor",
+      "observedOid",
+      "provenance",
+    ],
+    "source head ancestry",
+  );
+  return {
+    integrationHeadOid: oidValue(
+      record.integrationHeadOid,
+      "source ancestry integration head",
+    ),
+    sourceHeadOid: oidValue(
+      record.sourceHeadOid,
+      "source ancestry source head",
+    ),
+    isAncestor: boolean(record.isAncestor, "source ancestry result"),
+    observedOid: oidValue(record.observedOid, "source ancestry observed head"),
+    provenance: literal(
+      record.provenance,
+      ["provider", "modeled", "observed", "derived"] as const,
+      "source ancestry provenance",
     ),
   };
 }

@@ -68,6 +68,17 @@ export function stabilityFacts(): RepositoryFacts {
         provenance: "modeled",
       },
     },
+    sourceHeadBasedOnIntegration: {
+      status: "ready",
+      provenance: "modeled",
+      value: {
+        integrationHeadOid: oid("integration-1"),
+        sourceHeadOid: oid("contribution-1"),
+        isAncestor: true,
+        observedOid: oid("contribution-1"),
+        provenance: "modeled",
+      },
+    },
     integrationBranch: {
       status: "ready",
       provenance: "modeled",

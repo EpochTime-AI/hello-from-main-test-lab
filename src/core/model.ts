@@ -73,6 +73,13 @@ export type BranchAnchor = {
   provenance: Provenance;
 };
 
+/** A provider or Git-derived proof that the Integration head is in the source head's ancestry. */
+export type SourceHeadAncestry = OidBound<{
+  integrationHeadOid: Oid;
+  sourceHeadOid: Oid;
+  isAncestor: boolean;
+}>;
+
 export type ProviderEligibility = {
   checks: Observation<readonly CheckFact[]>;
   reviews: Observation<readonly ReviewFact[]>;
@@ -88,6 +95,7 @@ export type RepositoryFacts = {
     cardPayloads?: readonly CardPayload[];
   }>;
   sourcePullRequest: Observation<PullRequestFact>;
+  sourceHeadBasedOnIntegration?: Observation<SourceHeadAncestry>;
   integrationBranch: Observation<BranchAnchor>;
   integrationPullRequest: Observation<PullRequestFact>;
   candidate: Observation<CandidateFact>;

@@ -3,8 +3,10 @@ import { describe, expect, test } from "vitest";
 import {
   createGitAuthenticationEnv,
   createGitRunner,
+  GitCommandError,
   installGitAuthentication,
 } from "../../src/adapters/git.js";
+import { gitFailureDetail } from "../../src/entry/action-runtime.js";
 
 describe("Git authentication boundary", () => {
   test("uses askpass environment without putting the token in argv", async () => {
@@ -41,5 +43,24 @@ describe("Git authentication boundary", () => {
     );
     controller.abort();
     await expect(pending).rejects.toBeDefined();
+  });
+
+  test("reports sanitized Project Shell Git setup detail", () => {
+    const token = "secret-token";
+    const detail = gitFailureDetail(
+      new GitCommandError({
+        commandId: "git-1",
+        argv: ["push", `https://x-access-token:${token}@example.test/repo`],
+        cwd: "/tmp/private",
+        stdout: token,
+        stderr: `failed ${token}`,
+        status: 128,
+      }),
+    );
+    expect(detail).toBe(
+      "Project Shell setup failed: operation=push; status=128; category=repository-or-auth",
+    );
+    expect(detail).not.toContain(token);
+    expect(detail).not.toContain("example.test");
   });
 });

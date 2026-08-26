@@ -1791,7 +1791,10 @@ describe("OctokitGithubPlatform", () => {
         rest: async (request) => {
           if (request.path.endsWith("/git/ref/heads/main"))
             return { status: 200, data: { object: { sha: "main-1" } } };
-          if (request.path.endsWith("/git/trees/main-1"))
+          if (
+            request.path.endsWith("/git/trees/main-1") ||
+            request.path.endsWith("/git/trees/integration-1")
+          )
             return {
               status: 200,
               data: {
@@ -1859,7 +1862,7 @@ describe("OctokitGithubPlatform", () => {
     });
   });
 
-  test("uses an explicit merge method, rejects merged:false, and looks up lost responses", async () => {
+  test("uses PUT with an exact head guard, rejects merged:false, and looks up lost responses", async () => {
     const requests: unknown[] = [];
     const rejected = createOctokitGithubPlatform({
       owner: "acme",
@@ -1887,6 +1890,8 @@ describe("OctokitGithubPlatform", () => {
     });
     expect(requests[0]).toEqual(
       expect.objectContaining({
+        method: "PUT",
+        path: "/repos/acme/hello/pulls/3/merge",
         parameters: { sha: "head", merge_method: "merge" },
       }),
     );
@@ -1912,6 +1917,66 @@ describe("OctokitGithubPlatform", () => {
         expectedHeadOid: oid("head"),
       }),
     ).resolves.toEqual({ kind: "contributionMerged", headOid: oid("merge-1") });
+  });
+
+  test("requires an exact merged SHA readback after a successful PUT", async () => {
+    let calls = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      replay: true,
+      transport: {
+        rest: async () => {
+          calls += 1;
+          return calls === 1
+            ? { status: 200, data: { merged: true, sha: "merge-1" } }
+            : {
+                status: 200,
+                data: { merged: true, merge_commit_sha: "other" },
+              };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await expect(
+      platform.mergePullRequest({
+        kind: "contribution",
+        pullRequestNumber: 3,
+        expectedHeadOid: oid("head"),
+      }),
+    ).resolves.toEqual({
+      kind: "contributionRejected",
+      reason: "stalePrecondition",
+    });
+  });
+
+  test.each([
+    [404, "notFound"],
+    [405, "policyRejected"],
+    [409, "stalePrecondition"],
+    [422, "policyRejected"],
+  ] as const)("fails closed for merge response %i", async (status, reason) => {
+    const requests: { method: string }[] = [];
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      replay: true,
+      transport: {
+        rest: async (request) => {
+          requests.push(request);
+          return { status, data: { message: "provider rejection" } };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await expect(
+      platform.mergePullRequest({
+        kind: "contribution",
+        pullRequestNumber: 3,
+        expectedHeadOid: oid("head"),
+      }),
+    ).resolves.toEqual({ kind: "contributionRejected", reason });
+    expect(requests).toEqual([expect.objectContaining({ method: "PUT" })]);
   });
 
   test("fails closed for production Integration merges until a provider base-current gate exists", async () => {
@@ -2705,6 +2770,134 @@ describe("OctokitGithubPlatform", () => {
           blobOid: oid("card"),
         }),
       ],
+    });
+  });
+
+  test("aggregates validated multi-page Compare links and rejects duplicate commits", async () => {
+    const transport = (duplicate = false): OctokitRequestTransport => ({
+      rest: async (request) => {
+        if (request.path.endsWith("/git/ref/heads/main"))
+          return { status: 200, data: { object: { sha: "main" } } };
+        if (request.path.endsWith("/pulls"))
+          return {
+            status: 200,
+            data: [
+              {
+                number: 1,
+                state: "open",
+                draft: false,
+                user: { login: "alice", id: 7 },
+                head: {
+                  ref: "add/alice",
+                  sha: "source",
+                  repo: { fork: true, owner: { login: "alice" } },
+                },
+                base: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration",
+                },
+              },
+              {
+                number: 2,
+                state: "open",
+                draft: true,
+                head: {
+                  ref: "feature/card-alice-source-1",
+                  sha: "integration",
+                },
+                base: { ref: "main", sha: "main" },
+              },
+            ],
+          };
+        if (request.path.includes("matching-refs"))
+          return { status: 200, data: [] };
+        if (request.path === "/repos/acme/hello/compare/integration...source")
+          return {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: { sha: "integration" },
+              head_commit: { sha: "source" },
+              merge_base_commit: { sha: "integration" },
+              commits: [{ sha: "one" }],
+              total_commits: 2,
+            },
+            headers: {
+              link: '<https://api.github.com/repos/acme/hello/compare/integration...source?per_page=100&page=2>; rel="next"',
+            },
+          };
+        if (
+          request.path ===
+          "/repos/acme/hello/compare/integration...source?per_page=100&page=2"
+        )
+          return {
+            status: 200,
+            data: {
+              status: "ahead",
+              base_commit: { sha: "integration" },
+              head_commit: { sha: "source" },
+              merge_base_commit: { sha: "integration" },
+              commits: [{ sha: duplicate ? "one" : "two" }],
+              total_commits: 2,
+            },
+          };
+        if (request.path.endsWith("/pulls/1/files"))
+          return {
+            status: 200,
+            data: [{ filename: "people/alice.md", sha: "card" }],
+          };
+        if (
+          request.path.endsWith("/git/trees/main") ||
+          request.path.endsWith("/git/trees/integration")
+        )
+          return {
+            status: 200,
+            data: {
+              tree: [{ path: "README.md", type: "blob", sha: "readme" }],
+            },
+          };
+        if (request.path.endsWith("/git/blobs/readme"))
+          return {
+            status: 200,
+            data: {
+              encoding: "base64",
+              content: Buffer.from("# Hello\n").toString("base64"),
+            },
+          };
+        if (request.path.endsWith("/git/blobs/card"))
+          return {
+            status: 200,
+            data: {
+              encoding: "base64",
+              content: Buffer.from(
+                "---\ngithub: alice\ngithub_id: 7\nsource_pr: 1\n---\n\n# Alice\n\n最近在折腾：Git\n\n> Hi\n",
+              ).toString("base64"),
+            },
+          };
+        if (request.path.endsWith("/commits/integration/check-runs"))
+          return { status: 200, data: { check_runs: [] } };
+        if (request.path.endsWith("/pulls/2/reviews"))
+          return { status: 200, data: [] };
+        throw new Error(`unexpected ${request.path}`);
+      },
+      graphql: async () => ({ data: {} }),
+    });
+    const complete = await createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport: transport(),
+    }).observeRepository();
+    expect(complete.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "ready",
+      value: { isAncestor: true },
+    });
+    const malformed = await createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport: transport(true),
+    }).observeRepository();
+    expect(malformed.value?.sourceHeadBasedOnIntegration).toMatchObject({
+      status: "incomplete",
     });
   });
 

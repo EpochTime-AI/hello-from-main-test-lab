@@ -131,7 +131,18 @@ export function validateIntake(
     }
   }
   const branchHead = facts.integrationBranch.value?.headOid;
-  if (branchHead && source && source.baseOid !== branchHead)
+  const ancestry = facts.sourceHeadBasedOnIntegration;
+  if (
+    branchHead &&
+    source &&
+    !source.merged &&
+    (source.baseOid !== branchHead ||
+      ancestry?.status !== "ready" ||
+      !ancestry.value ||
+      ancestry.value.integrationHeadOid !== branchHead ||
+      ancestry.value.sourceHeadOid !== source.headOid ||
+      ancestry.value.isAncestor !== true)
+  )
     issues.push({ category: "integration-base-or-ancestry" });
   return issues.length > 0
     ? {
@@ -392,6 +403,11 @@ function deriveEffect(
   if (source.baseOid !== branchHeadOid) {
     return { kind: "retarget", pullRequestNumber: source.number, branchName };
   }
+  if (
+    facts.sourceHeadBasedOnIntegration?.status !== "ready" ||
+    !facts.sourceHeadBasedOnIntegration.value
+  )
+    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (
     commentsSupported &&
     (!source.authorGithubId || !facts.trustedCommentOwner)
@@ -1047,6 +1063,16 @@ function completionEffect(
 
 function awaitingIncomplete(): ReconcileOutcome {
   return { kind: "awaitingExternalFact", reason: "incomplete" };
+}
+
+function sourceAncestryOutcome(
+  status: Observation<unknown>["status"] | undefined,
+): ReconcileOutcome {
+  if (status === "readFailed")
+    return { kind: "retryable", reason: "retryableTransport" };
+  if (status === "notVisibleYet")
+    return { kind: "awaitingExternalFact", reason: "notVisibleYet" };
+  return awaitingIncomplete();
 }
 
 function candidateWriteOutcome(
