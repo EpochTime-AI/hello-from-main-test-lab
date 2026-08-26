@@ -2322,8 +2322,8 @@ function pullRequestFact(value, kind, exact = false) {
     draft: record.draft === true,
     ...record.merged === true || record.merged === false ? { merged: record.merged } : {},
     ...record.state === "closed" ? { closed: true } : {},
-    ...typeof record.merge_commit_sha === "string" && record.merge_commit_sha.length > 0 ? { mergeCommitOid: oid(record.merge_commit_sha) } : {},
-    ...Array.isArray(record.merge_commit_parents) ? {
+    ...record.merged === true && typeof record.merge_commit_sha === "string" && record.merge_commit_sha.length > 0 ? { mergeCommitOid: oid(record.merge_commit_sha) } : {},
+    ...record.merged === true && Array.isArray(record.merge_commit_parents) ? {
       mergeParentOids: record.merge_commit_parents.filter((value2) => typeof value2 === "string").map(oid)
     } : {},
     ...typeof asRecord2(record.user).login === "string" ? { authorLogin: stringValue(asRecord2(record.user).login) } : {},
@@ -2350,7 +2350,7 @@ function validateExactPullRequestLifecycle(record) {
     );
   const mergedAt = record.merged_at;
   const mergeCommitSha = record.merge_commit_sha;
-  if (record.state === "open" && (record.merged || !absentOrNull(mergedAt) || !absentOrNull(mergeCommitSha)))
+  if (record.state === "open" && (record.merged || !absentOrNull(mergedAt) || mergeCommitSha !== void 0 && mergeCommitSha !== null && (typeof mergeCommitSha !== "string" || mergeCommitSha.length === 0)))
     throw new OctokitOperationError(
       "retryableTransport",
       "malformed open pull request lifecycle"

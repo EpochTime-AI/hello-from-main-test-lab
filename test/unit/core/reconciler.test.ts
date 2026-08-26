@@ -978,7 +978,7 @@ describe("production reconciler boundary", () => {
     expect(result).toEqual({ kind: "terminal", reason: "policyRejected" });
   });
 
-  test("plans candidate/H2 work after a merged Contribution when main has drifted", async () => {
+  test("plans candidate/H2 work after main drift without using an open PR synthetic merge SHA", async () => {
     const facts = stabilityFacts();
     const main = facts.main.value;
     if (!main) throw new Error("main is required");
@@ -990,6 +990,9 @@ describe("production reconciler boundary", () => {
             value: {
               ...facts.integrationPullRequest.value,
               baseOid: oid("main-1"),
+              merged: false,
+              closed: false,
+              mergeCommitOid: oid("ca73e4a5df68a8c756a4ff4f16018f47b7961e61"),
             },
           }
         : {}),
@@ -1036,6 +1039,9 @@ describe("production reconciler boundary", () => {
     expect(writes[0]?.input.observedMainOid).toBe(oid("main-2"));
     expect(writes[0]?.input.expectedIntegrationHeadOid).toBe(
       oid("integration-1"),
+    );
+    expect(writes[0]?.postconditions.history.retainCommitOids).not.toContain(
+      oid("ca73e4a5df68a8c756a4ff4f16018f47b7961e61"),
     );
   });
 

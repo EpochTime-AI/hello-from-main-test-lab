@@ -2517,9 +2517,41 @@ describe("OctokitGithubPlatform", () => {
     },
   );
 
+  test("accepts a live-shaped open Integration PR without treating its synthetic merge SHA as a fact", async () => {
+    const requests: string[] = [];
+    const platform = createLifecycleObservationPlatform({
+      sourceList: { state: "open" },
+      sourceExact: { state: "open", merged: false },
+      integrationExact: {
+        merged_at: null,
+        merge_commit_sha: "ca73e4a5df68a8c756a4ff4f16018f47b7961e61",
+        mergeable: true,
+        mergeable_state: "clean",
+      },
+      onRequest: (request) => requests.push(request.path),
+    });
+
+    const observed = await platform.observeRepository();
+
+    expect(observed).toMatchObject({ status: "ready" });
+    expect(observed.value?.integrationPullRequest.value).toMatchObject({
+      number: 2,
+      merged: false,
+    });
+    expect(observed.value?.integrationPullRequest.value).not.toHaveProperty(
+      "mergeCommitOid",
+    );
+    expect(observed.value?.integrationPullRequest.value).not.toHaveProperty(
+      "mergeParentOids",
+    );
+    expect(requests).not.toContain(
+      "/repos/acme/hello/git/commits/ca73e4a5df68a8c756a4ff4f16018f47b7961e61",
+    );
+  });
+
   test.each([
+    ["merged", { merged: true }],
     ["merged_at", { merged_at: "2026-08-26T00:00:00Z" }],
-    ["merge_commit_sha", { merge_commit_sha: "source-merge" }],
   ] as const)("marks open PR with %s incomplete", async (_name, patch) => {
     const platform = createLifecycleObservationPlatform({
       sourceList: { state: "open" },
@@ -4119,12 +4151,14 @@ function createLifecycleObservationPlatform(input: {
   integrationList?: Record<string, unknown>;
   integrationExact?: Record<string, unknown>;
   mergeCommit?: Record<string, unknown>;
+  onRequest?: (request: { method: string; path: string }) => void;
 }) {
   return createOctokitGithubPlatform({
     owner: "acme",
     repo: "hello",
     transport: {
       rest: async (request) => {
+        input.onRequest?.(request);
         if (request.path.endsWith("/git/ref/heads/main"))
           return { status: 200, data: { object: { sha: "main" } } };
         if (request.path.endsWith("/pulls"))

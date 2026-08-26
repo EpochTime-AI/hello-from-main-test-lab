@@ -1909,11 +1909,12 @@ function pullRequestFact(
       ? { merged: record.merged }
       : {}),
     ...(record.state === "closed" ? { closed: true } : {}),
-    ...(typeof record.merge_commit_sha === "string" &&
+    ...(record.merged === true &&
+    typeof record.merge_commit_sha === "string" &&
     record.merge_commit_sha.length > 0
       ? { mergeCommitOid: oid(record.merge_commit_sha) }
       : {}),
-    ...(Array.isArray(record.merge_commit_parents)
+    ...(record.merged === true && Array.isArray(record.merge_commit_parents)
       ? {
           mergeParentOids: record.merge_commit_parents
             .filter((value): value is string => typeof value === "string")
@@ -1967,7 +1968,11 @@ function validateExactPullRequestLifecycle(
   const mergeCommitSha = record.merge_commit_sha;
   if (
     record.state === "open" &&
-    (record.merged || !absentOrNull(mergedAt) || !absentOrNull(mergeCommitSha))
+    (record.merged ||
+      !absentOrNull(mergedAt) ||
+      (mergeCommitSha !== undefined &&
+        mergeCommitSha !== null &&
+        (typeof mergeCommitSha !== "string" || mergeCommitSha.length === 0)))
   )
     throw new OctokitOperationError(
       "retryableTransport",
