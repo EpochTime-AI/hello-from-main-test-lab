@@ -25,6 +25,7 @@ type RestRequest = {
   method: RestMethod;
   path: string;
   parameters?: Record<string, unknown>;
+  headers?: Record<string, string>;
   signal?: AbortSignal;
 };
 type RestResponse = {
@@ -56,6 +57,14 @@ type ReadyState = {
   candidate: NonNullable<RepositoryFacts["candidate"]["value"]>;
 };
 
+type CommentCreatePermit = {
+  runIdentity: string;
+  targetPullRequestNumber: number;
+  slot: "source-status" | "integration-status";
+  phase: "setup" | "ready-guidance";
+  milestone: "setup" | "ready";
+};
+
 export type OctokitGithubPlatformOptions = {
   owner: string;
   repo: string;
@@ -66,6 +75,7 @@ export type OctokitGithubPlatformOptions = {
   pullRequestNodeIds?: ReadonlyMap<number, string>;
   expectedCommentOwner?: TrustedPrincipal;
   apiOrigin?: string;
+  repositoryId?: number;
   commentReadback?: {
     attempts?: number;
     delayMs?: number;
@@ -102,8 +112,10 @@ export function createOctokitGithubPlatform(
   let lastFacts = options.initialFacts;
   let activeSignal: AbortSignal | undefined;
   const apiOrigin = normalizeApiOrigin(options.apiOrigin);
+  const repositoryId = options.repositoryId;
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = new Set<string>();
+  const commentCreatePermits: CommentCreatePermit[] = [];
   const path = (suffix: string) =>
     `/repos/${options.owner}/${options.repo}${suffix}`;
   const apiCommentPath = (suffix: string) => path(suffix);
@@ -359,10 +371,10 @@ export function createOctokitGithubPlatform(
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return {
+        return grantSetupCommentCreatePermit({
           kind: "succeeded",
           value: { branch: branchFromResponse(response.data, input.name) },
-        };
+        });
       if (response.status === 422) {
         try {
           const branch = await readBranch(input.name);
@@ -423,10 +435,10 @@ export function createOctokitGithubPlatform(
                   )
               : undefined;
             if (found)
-              return {
+              return grantSetupCommentCreatePermit({
                 kind: "alreadyApplied",
                 value: { pullRequest: pullRequestFact(found, "integration") },
-              };
+              });
           } catch {
             // The provider may still be converging; retain unknown outcome.
           }
@@ -434,10 +446,10 @@ export function createOctokitGithubPlatform(
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return {
+        return grantSetupCommentCreatePermit({
           kind: "succeeded",
           value: { pullRequest: pullRequestFact(response.data, "integration") },
-        };
+        });
       return operationFailure(response);
     },
     async updatePullRequestBase(
@@ -465,7 +477,10 @@ export function createOctokitGithubPlatform(
         const updated = pullRequestFact(response.data, "contribution");
         if (updated.baseRef !== input.integrationBranchName)
           return { kind: "stalePrecondition" };
-        return { kind: "succeeded", value: updated };
+        return grantSetupCommentCreatePermit({
+          kind: "succeeded",
+          value: updated,
+        });
       }
       return operationFailure(response);
     },
@@ -513,11 +528,18 @@ export function createOctokitGithubPlatform(
       if (post.headOid !== oid(input.expectedCandidateHeadOid))
         return { kind: "headChanged", observedHeadOid: post.headOid };
       if (post.draft) return { kind: "blocked", reason: "unknownOutcome" };
-      return {
+      const result = {
         kind: "readyAtExpectedCandidate",
         pullRequest: post,
         candidate: state.candidate,
-      };
+      } as const;
+      grantCommentCreatePermit({
+        targetPullRequestNumber: input.pullRequestNumber,
+        slot: "integration-status",
+        phase: "ready-guidance",
+        milestone: "ready",
+      });
+      return result;
     },
     async mergePullRequest(
       request: ContributionMergeRequest | IntegrationMergeRequest,
@@ -571,10 +593,10 @@ export function createOctokitGithubPlatform(
         )
           return { kind: "ambiguousOwnership" };
         if (commentLifecycle.has(commentLifecycleKey(intent))) {
-          const recovered = await reconcileAmbiguousCreate(intent, expected);
-          if (recovered.kind !== "unknownOutcome")
-            commentLifecycle.delete(commentLifecycleKey(intent));
-          return recovered;
+          return {
+            kind: "capabilityUnavailable",
+            detail: "comment creation is already reserved in this process",
+          };
         }
         const current = owned[0];
         if (current) {
@@ -626,6 +648,13 @@ export function createOctokitGithubPlatform(
             ? { kind: "updated", comment: post }
             : { kind: "stale" };
         }
+
+        if (!reserveCommentCreatePermit(intent))
+          return {
+            kind: "capabilityUnavailable",
+            detail:
+              "missing same-process durable milestone for comment creation",
+          };
 
         let response: RestResponse;
         commentLifecycle.add(commentLifecycleKey(intent));
@@ -1117,6 +1146,7 @@ export function createOctokitGithubPlatform(
       method: "GET",
       path: apiCommentPath(`/issues/${pullRequestNumber}/comments`),
       parameters: { per_page: 100, page: 1 },
+      headers: { "cache-control": "no-cache" },
     };
     for (let page = 0; page < COMMENT_PAGE_BUDGET; page += 1) {
       const response = await requestCommentRest(request, [200], "read");
@@ -1141,6 +1171,7 @@ export function createOctokitGithubPlatform(
         pullRequestNumber,
         apiCommentPath,
         apiOrigin,
+        repositoryId,
       );
       if (next.kind === "terminal") return deduplicateComments(all);
       if (next.kind === "malformed")
@@ -1154,7 +1185,11 @@ export function createOctokitGithubPlatform(
           "cyclic issue comments pagination",
         );
       seenUrls.add(next.url);
-      request = { method: "GET", path: next.url };
+      request = {
+        method: "GET",
+        path: next.url,
+        headers: { "cache-control": "no-cache" },
+      };
     }
     throw new OctokitOperationError(
       "unknownOutcome",
@@ -1167,7 +1202,11 @@ export function createOctokitGithubPlatform(
     pullRequestNumber: number,
   ): Promise<CommentFact> {
     const response = await requestCommentRest(
-      { method: "GET", path: apiCommentPath(`/issues/comments/${commentId}`) },
+      {
+        method: "GET",
+        path: apiCommentPath(`/issues/comments/${commentId}`),
+        headers: { "cache-control": "no-cache" },
+      },
       [200],
       "read",
     );
@@ -1265,6 +1304,51 @@ export function createOctokitGithubPlatform(
     }
   }
 
+  function grantSetupCommentCreatePermit<T>(result: T): T {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    if (source)
+      grantCommentCreatePermit({
+        targetPullRequestNumber: source.number,
+        slot: "source-status",
+        phase: "setup",
+        milestone: "setup",
+      });
+    return result;
+  }
+
+  function grantCommentCreatePermit(input: {
+    targetPullRequestNumber: number;
+    slot: "source-status" | "integration-status";
+    phase: "setup" | "ready-guidance";
+    milestone: "setup" | "ready";
+  }): void {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    if (!source?.authorGithubId) return;
+    commentCreatePermits.push({
+      runIdentity: `source:${source.number}:${source.authorGithubId}`,
+      ...input,
+    });
+  }
+
+  function reserveCommentCreatePermit(intent: CommentIntent): boolean {
+    if (intent.phase === "completion") return false;
+    const key = parseCommentActionKey(intent.actionKey);
+    const index = commentCreatePermits.findIndex(
+      (permit) =>
+        key !== undefined &&
+        key.runIdentity === permit.runIdentity &&
+        key.targetPullRequestNumber === permit.targetPullRequestNumber &&
+        key.slot === permit.slot &&
+        intent.targetPullRequestNumber === permit.targetPullRequestNumber &&
+        intent.slot === permit.slot &&
+        intent.phase === permit.phase &&
+        milestoneForCommentPhase(intent.phase) === permit.milestone,
+    );
+    if (index < 0) return false;
+    commentCreatePermits.splice(index, 1);
+    return true;
+  }
+
   async function findIntegrationBranch(
     expectedName?: string,
   ): Promise<BranchAnchor | undefined> {
@@ -1351,6 +1435,14 @@ export function createOctokitGithubPlatform(
   }
 }
 
+function milestoneForCommentPhase(
+  phase: CommentIntent["phase"],
+): "setup" | "ready" | undefined {
+  if (phase === "setup") return "setup";
+  if (phase === "ready-guidance") return "ready";
+  return undefined;
+}
+
 const COMMENT_PAGE_BUDGET = 8;
 
 function normalizeApiOrigin(value: string | undefined): URL {
@@ -1370,6 +1462,28 @@ function boundedReadbackAttempts(value: number | undefined): number {
 
 function commentLifecycleKey(intent: CommentIntent): string {
   return `${intent.targetPullRequestNumber}:${intent.actionKey}`;
+}
+
+function parseCommentActionKey(value: string):
+  | {
+      runIdentity: string;
+      targetPullRequestNumber: number;
+      slot: "source-status" | "integration-status";
+    }
+  | undefined {
+  const match =
+    /^run=([^;]+);target=([1-9][0-9]*);slot=(source-status|integration-status)$/u.exec(
+      value,
+    );
+  if (!match?.[1] || !match[2] || !match[3]) return undefined;
+  const targetPullRequestNumber = Number(match[2]);
+  return Number.isSafeInteger(targetPullRequestNumber)
+    ? {
+        runIdentity: match[1],
+        targetPullRequestNumber,
+        slot: match[3] as "source-status" | "integration-status",
+      }
+    : undefined;
 }
 
 async function waitForCommentReadback(
@@ -1763,6 +1877,7 @@ function nextCommentPage(
   target: number,
   repositoryPath: (suffix: string) => string,
   trustedOrigin: URL,
+  repositoryId: number | undefined,
 ): CommentNext {
   if (raw === undefined) return { kind: "terminal" };
   if (raw.trim().length === 0) return { kind: "malformed" };
@@ -1804,8 +1919,13 @@ function nextCommentPage(
     if (
       url.origin !== trustedOrigin.origin ||
       currentUrl.origin !== trustedOrigin.origin ||
-      url.pathname !==
-        `${trustedApiPath(trustedOrigin)}${repositoryPath(`/issues/${target}/comments`)}` ||
+      !trustedCommentListPath(
+        url.pathname,
+        target,
+        repositoryPath,
+        trustedOrigin,
+        repositoryId,
+      ) ||
       !positiveInteger(url.searchParams.get("page")) ||
       !positiveInteger(currentUrl.searchParams.get("page") ?? "1") ||
       Number(url.searchParams.get("page")) <=
@@ -1816,6 +1936,23 @@ function nextCommentPage(
   } catch {
     return { kind: "malformed" };
   }
+}
+
+function trustedCommentListPath(
+  pathname: string,
+  target: number,
+  repositoryPath: (suffix: string) => string,
+  trustedOrigin: URL,
+  repositoryId: number | undefined,
+): boolean {
+  const apiPath = trustedApiPath(trustedOrigin);
+  if (pathname === `${apiPath}${repositoryPath(`/issues/${target}/comments`)}`)
+    return true;
+  return (
+    repositoryId !== undefined &&
+    pathname ===
+      `${apiPath}/repositories/${repositoryId}/issues/${target}/comments`
+  );
 }
 
 function positiveInteger(value: string | null): boolean {

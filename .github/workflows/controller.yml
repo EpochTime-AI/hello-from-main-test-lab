@@ -31,5 +31,5 @@ jobs:
           HELLO_FROM_MAIN_REMOTE: origin
           HELLO_FROM_MAIN_SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
           HELLO_FROM_MAIN_SOURCE_LOGIN: ${{ github.event.pull_request.user.login }}
-          HELLO_FROM_MAIN_COMMENT_OWNER_ID: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_ID }}
-          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE }}
+          HELLO_FROM_MAIN_COMMENT_OWNER_ID: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_ID || (github.server_url == 'https://github.com' && '41898282') }}
+          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: ${{ vars.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE || (github.server_url == 'https://github.com' && 'Bot') }}

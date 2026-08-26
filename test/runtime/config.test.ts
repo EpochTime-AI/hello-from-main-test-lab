@@ -23,19 +23,128 @@ describe("production integration runtime configuration", () => {
       sourcePullRequestNumber: 42,
       sourceLogin: "alice",
       commentOwner: { actorId: "42", actorType: "Bot" },
+      apiOrigin: "https://api.github.com",
     });
   });
 
   test("fails closed when the required comment principal is absent", () => {
     expect(() =>
       deriveIntegrationRuntimeConfig({
-        env: {},
+        env: {
+          HELLO_FROM_MAIN_API_ORIGIN:
+            "https://github.enterprise.example/api/v3",
+          GITHUB_API_URL: "https://github.enterprise.example/api/v3",
+          GITHUB_SERVER_URL: "https://github.enterprise.example",
+        },
         defaultBranch: "main",
         context: {
           sourcePullRequest: { number: 42, authorLogin: "alice" },
         },
       }),
     ).toThrow("comment owner principal");
+  });
+
+  test("uses the public GitHub Actions principal only on the public API host", () => {
+    const base = {
+      defaultBranch: "main",
+      context: { sourcePullRequest: { number: 42, authorLogin: "alice" } },
+    };
+    expect(
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          GITHUB_API_URL: "https://api.github.com",
+          GITHUB_SERVER_URL: "https://github.com",
+        },
+      }),
+    ).toMatchObject({
+      commentOwner: { actorId: "41898282", actorType: "Bot" },
+    });
+    expect(() =>
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          HELLO_FROM_MAIN_API_ORIGIN:
+            "https://github.enterprise.example/api/v3",
+        },
+      }),
+    ).toThrow("coherent");
+    expect(
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          HELLO_FROM_MAIN_COMMENT_OWNER_ID: "42",
+          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: "Bot",
+        },
+      }),
+    ).toMatchObject({ commentOwner: { actorId: "42", actorType: "Bot" } });
+  });
+
+  test("uses standard GHES identity, rejects public fallback, and permits only coherent custom origins", () => {
+    const base = {
+      defaultBranch: "main",
+      context: { sourcePullRequest: { number: 42, authorLogin: "alice" } },
+    };
+    const ghes = {
+      GITHUB_API_URL: "https://github.enterprise.example/api/v3",
+      GITHUB_SERVER_URL: "https://github.enterprise.example",
+    };
+    expect(() =>
+      deriveIntegrationRuntimeConfig({ ...base, env: ghes }),
+    ).toThrow("comment owner principal");
+    expect(
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          ...ghes,
+          HELLO_FROM_MAIN_COMMENT_OWNER_ID: "42",
+          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: "Bot",
+          HELLO_FROM_MAIN_API_ORIGIN:
+            "https://github.enterprise.example/api/v3/",
+        },
+      }),
+    ).toMatchObject({
+      apiOrigin: "https://github.enterprise.example/api/v3",
+      commentOwner: { actorId: "42", actorType: "Bot" },
+    });
+    expect(() =>
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          ...ghes,
+          HELLO_FROM_MAIN_COMMENT_OWNER_ID: "42",
+          HELLO_FROM_MAIN_COMMENT_OWNER_TYPE: "Bot",
+          HELLO_FROM_MAIN_API_ORIGIN: "https://api.github.com",
+        },
+      }),
+    ).toThrow("coherent");
+    expect(() =>
+      deriveIntegrationRuntimeConfig({
+        ...base,
+        env: {
+          GITHUB_API_URL: "https://api.github.com",
+          GITHUB_SERVER_URL: "https://github.enterprise.example",
+        },
+      }),
+    ).toThrow("coherent");
+  });
+
+  test("sends no-cache only when the adapter requests a fresh comment read", async () => {
+    let headers: HeadersInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL, init?: RequestInit) => {
+        headers = init?.headers;
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    await createGithubTransport("token").rest({
+      method: "GET",
+      path: "/repos/acme/hello/issues/7/comments",
+      headers: { "cache-control": "no-cache" },
+    });
+    expect(new Headers(headers).get("cache-control")).toBe("no-cache");
+    vi.unstubAllGlobals();
   });
 
   test("fails closed when source PR identity cannot be derived", () => {

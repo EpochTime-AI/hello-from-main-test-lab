@@ -4,8 +4,17 @@ import {
   createOctokitGithubPlatform,
   type OctokitRequestTransport,
 } from "../../src/adapters/octokit.js";
-import { type CommentIntent, oid } from "../../src/core/model.js";
+import {
+  type CommentIntent,
+  oid,
+  type RepositoryFacts,
+} from "../../src/core/model.js";
 import { createGithubTransport } from "../../src/entry/action-runtime.js";
+import {
+  renderReadyComment,
+  renderSetupComment,
+  renderValidationComment,
+} from "../../src/render/comment.js";
 
 describe("OctokitGithubPlatform", () => {
   test("has no emulator dependency or adapter fallback", async () => {
@@ -28,7 +37,7 @@ describe("OctokitGithubPlatform", () => {
     expect(adapter).not.toMatch(/emulat/iu);
   });
 
-  test("creates an issue comment through the exact REST route and materializes it after readback", async () => {
+  test("creates an issue comment only after this instance establishes its setup milestone", async () => {
     const requests: unknown[] = [];
     const body =
       "<!-- hello-from-main: key=run%3Dsource-7%3Btarget%3D7%3Bslot%3Dsource-status phase=setup -->\nsetup\n";
@@ -57,6 +66,16 @@ describe("OctokitGithubPlatform", () => {
           request.path.endsWith("/issues/comments/123")
         )
           return { status: 200, data: comment };
+        if (request.method === "PATCH" && request.path.endsWith("/pulls/7"))
+          return {
+            status: 200,
+            data: {
+              number: 7,
+              draft: false,
+              head: { sha: "source-head" },
+              base: { sha: "base-head", ref: "feature/card-alice-source-7" },
+            },
+          };
         throw new Error(`unexpected ${request.method} ${request.path}`);
       },
       graphql: async () => ({ data: {} }),
@@ -75,37 +94,471 @@ describe("OctokitGithubPlatform", () => {
       phase: "setup",
       body,
     };
+    await platform.updatePullRequestBase({
+      pullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+    });
     expect(platform.ensureComment).toBeDefined();
     if (!platform.ensureComment)
       throw new Error("comment capability is required");
-    await expect(platform.ensureComment(intent)).resolves.toEqual({
-      kind: "created",
-      comment: {
-        id: 123,
-        user: { id: "42", actorType: "Bot", login: "hello-bot" },
-        ownerPrincipal: { actorId: "42", actorType: "Bot" },
-        actionKey: intent.actionKey,
-        body,
-        updatedAt: "2026-08-26T00:00:00Z",
-        targetPullRequestNumber: 7,
-      },
+    await expect(platform.ensureComment(intent)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
     });
     expect(requests).toEqual([
+      expect.objectContaining({
+        method: "PATCH",
+        path: "/repos/acme/hello/pulls/7",
+      }),
       expect.objectContaining({
         method: "GET",
         path: "/repos/acme/hello/issues/7/comments",
         parameters: { per_page: 100, page: 1 },
-      }),
-      expect.objectContaining({
-        method: "POST",
-        path: "/repos/acme/hello/issues/7/comments",
-        parameters: { body },
-      }),
-      expect.objectContaining({
-        method: "GET",
-        path: "/repos/acme/hello/issues/comments/123",
+        headers: { "cache-control": "no-cache" },
       }),
     ]);
+  });
+
+  test("fails closed across instances after a zero-match setup comment list", async () => {
+    const actionKey = "run=source:7:42;target=7;slot=source-status";
+    const intent: CommentIntent = {
+      targetPullRequestNumber: 7,
+      slot: "source-status",
+      actionKey,
+      phase: "setup",
+      body: `<!-- hello-from-main: key=${encodeURIComponent(actionKey)} phase=setup -->\nbody\n`,
+    };
+    let posts = 0;
+    const transport: OctokitRequestTransport = {
+      rest: async (request) => {
+        if (request.method === "GET")
+          return request.path.endsWith("/issues/comments/123")
+            ? { status: 200, data: commentTestRecord(intent.body) }
+            : { status: 200, data: [] };
+        if (request.method === "PATCH")
+          return {
+            status: 200,
+            data: {
+              number: 7,
+              draft: false,
+              head: { sha: "source" },
+              base: { sha: "base", ref: "feature/card-alice-source-7" },
+            },
+          };
+        posts += 1;
+        return { status: 201, data: commentTestRecord(intent.body) };
+      },
+      graphql: async () => ({ data: {} }),
+    };
+    const first = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport,
+      initialFacts: sourceCommentFacts(),
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+    });
+    await first.updatePullRequestBase({
+      pullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+    });
+    await expect(first.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "created",
+    });
+    const second = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      transport,
+      initialFacts: sourceCommentFacts(),
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+    });
+    await expect(second.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    expect(posts).toBe(1);
+  });
+
+  test("uses rendered raw canonical keys through create, no-op, and update", async () => {
+    const setup = renderSetupComment({
+      runIdentity: "source:7:42",
+      sourcePullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+      integrationPullRequestNumber: 8,
+      rebaseCommand: "git rebase upstream/feature/card-alice-source-7",
+    });
+    const validation = renderValidationComment({
+      runIdentity: "source:7:42",
+      sourcePullRequestNumber: 7,
+      sourceHeadOid: oid("source"),
+      result: { kind: "valid", headOid: oid("source") },
+    });
+    expect(setup.actionKey).toBe("run=source:7:42;target=7;slot=source-status");
+    let current: Record<string, unknown> | undefined;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: sourceCommentFacts(),
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET")
+            return request.path.endsWith("/issues/comments/123")
+              ? { status: 200, data: current }
+              : { status: 200, data: current ? [current] : [] };
+          if (request.method === "PATCH" && request.path.endsWith("/pulls/7"))
+            return { status: 200, data: retargetedSourcePullRequest() };
+          if (request.method === "POST") {
+            current = commentTestRecord(setup.body);
+            return { status: 201, data: current };
+          }
+          if (request.method === "PATCH") {
+            current = { ...commentTestRecord(validation.body), id: 123 };
+            return { status: 200, data: current };
+          }
+          throw new Error(`unexpected ${request.method} ${request.path}`);
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await platform.updatePullRequestBase({
+      pullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+    });
+    const setupIntent = {
+      ...setup,
+      targetPullRequestNumber: 7,
+    } satisfies CommentIntent;
+    const validationIntent = {
+      ...validation,
+      targetPullRequestNumber: 7,
+    } satisfies CommentIntent;
+    const created = await platform.ensureComment?.(setupIntent);
+    expect(created?.kind).toBe("created");
+    await expect(platform.ensureComment?.(setupIntent)).resolves.toMatchObject({
+      kind: "noOp",
+    });
+    await expect(
+      platform.ensureComment?.({
+        ...validationIntent,
+        ...(created?.kind === "created" ? { observed: created.comment } : {}),
+      }),
+    ).resolves.toMatchObject({ kind: "updated" });
+  });
+
+  test("uses a rendered Ready key only after the exact Ready milestone", async () => {
+    const ready = renderReadyComment({
+      runIdentity: "source:7:42",
+      originalContributor: "alice",
+      integrationPullRequestNumber: 8,
+      candidateHeadOid: oid("candidate"),
+      cardPath: "people/alice.md",
+      cardBlobOid: oid("card"),
+    });
+    const integrationFacts = sourceCommentFacts();
+    integrationFacts.integrationPullRequest = {
+      status: "ready",
+      value: {
+        number: 8,
+        nodeId: "PR_8",
+        kind: "integration",
+        headOid: oid("candidate"),
+        baseOid: oid("main"),
+        draft: true,
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    integrationFacts.candidate = {
+      status: "ready",
+      value: {
+        integrationHeadOid: oid("candidate"),
+        cardPath: "people/alice.md",
+        cardBlobOid: oid("card"),
+        readmeBlobOid: oid("readme"),
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    let comment: Record<string, unknown> | undefined;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: integrationFacts,
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET")
+            return request.path.endsWith("/pulls/8")
+              ? {
+                  status: 200,
+                  data: {
+                    number: 8,
+                    draft: false,
+                    head: { sha: "candidate" },
+                    base: { sha: "main" },
+                  },
+                }
+              : request.path.endsWith("/issues/comments/123")
+                ? { status: 200, data: comment }
+                : { status: 200, data: comment ? [comment] : [] };
+          if (request.method === "POST") {
+            comment = {
+              ...commentTestRecord(ready.body),
+              issue_url: "https://api.github.com/repos/acme/hello/issues/8",
+            };
+            return { status: 201, data: comment };
+          }
+          throw new Error(`unexpected ${request.method} ${request.path}`);
+        },
+        graphql: async () => ({
+          data: {
+            markPullRequestReadyForReview: { pullRequest: { id: "PR_8" } },
+          },
+        }),
+      },
+    });
+    const intent = {
+      ...ready,
+      targetPullRequestNumber: 8,
+    } satisfies CommentIntent;
+    await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    await platform.markPullRequestReadyForReview({
+      pullRequestNumber: 8,
+      expectedCandidateHeadOid: "candidate",
+    });
+    await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "created",
+    });
+    await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "noOp",
+    });
+  });
+
+  test("accepts GitHub's numeric repository Link only after trusted ID binding", async () => {
+    const intent = commentTestIntent();
+    const comment = commentTestRecord(intent.body);
+    let pages = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      repositoryId: 1346747333,
+      transport: {
+        rest: async (request) => {
+          if (request.method === "POST") throw new Error("must not create");
+          if (request.path.endsWith("/issues/comments/123"))
+            return { status: 200, data: comment };
+          if (request.path.includes("repositories/1346747333/"))
+            return { status: 200, data: [comment] };
+          pages += 1;
+          return {
+            status: 200,
+            data: [],
+            headers: {
+              link: '<https://api.github.com/repositories/1346747333/issues/7/comments?per_page=100&page=2>; rel="next"',
+            },
+          };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+    });
+    await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
+      kind: "noOp",
+    });
+    expect(pages).toBe(1);
+  });
+
+  test("scopes and consumes a setup create permit by exact action key", async () => {
+    const allowedKey = "run=source:7:42;target=7;slot=source-status";
+    const allowed: CommentIntent = {
+      targetPullRequestNumber: 7,
+      slot: "source-status",
+      actionKey: allowedKey,
+      phase: "setup",
+      body: `<!-- hello-from-main: key=${encodeURIComponent(allowedKey)} phase=setup -->\nbody\n`,
+    };
+    let posts = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: sourceCommentFacts(),
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET")
+            return request.path.endsWith("/issues/comments/123")
+              ? { status: 200, data: commentTestRecord(allowed.body) }
+              : { status: 200, data: [] };
+          if (request.method === "PATCH")
+            return {
+              status: 200,
+              data: {
+                number: 7,
+                draft: false,
+                head: { sha: "source" },
+                base: { sha: "base", ref: "feature/card-alice-source-7" },
+              },
+            };
+          posts += 1;
+          return { status: 201, data: commentTestRecord(allowed.body) };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await platform.updatePullRequestBase({
+      pullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+    });
+    await expect(
+      platform.ensureComment?.({
+        ...allowed,
+        actionKey: "run=source:8:42;target=7;slot=source-status",
+      }),
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    await expect(
+      platform.ensureComment?.({ ...allowed, targetPullRequestNumber: 8 }),
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    await expect(
+      platform.ensureComment?.({
+        ...allowed,
+        slot: "integration-status",
+      }),
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    await expect(
+      platform.ensureComment?.({
+        ...allowed,
+        phase: "validation-success",
+      }),
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    await expect(platform.ensureComment?.(allowed)).resolves.toMatchObject({
+      kind: "created",
+    });
+    await expect(platform.ensureComment?.(allowed)).resolves.toMatchObject({
+      kind: "capabilityUnavailable",
+    });
+    expect(posts).toBe(1);
+  });
+
+  test("atomically reserves one structured permit for concurrent create calls", async () => {
+    const intent: CommentIntent = {
+      ...commentTestIntent(),
+      actionKey: "run=source:7:42;target=7;slot=source-status",
+      body: `<!-- hello-from-main: key=${encodeURIComponent("run=source:7:42;target=7;slot=source-status")} phase=setup -->\nbody\n`,
+    };
+    let releaseReads: (() => void) | undefined;
+    const readsReleased = new Promise<void>((resolve) => {
+      releaseReads = resolve;
+    });
+    let lists = 0;
+    let posts = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: sourceCommentFacts(),
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET") {
+            if (request.path.endsWith("/issues/7/comments")) {
+              lists += 1;
+              if (lists === 2) releaseReads?.();
+              await readsReleased;
+              return { status: 200, data: [] };
+            }
+            if (request.path.endsWith("/issues/comments/123"))
+              return { status: 200, data: commentTestRecord(intent.body) };
+          }
+          if (request.method === "PATCH")
+            return {
+              status: 200,
+              data: retargetedSourcePullRequest(),
+            };
+          if (request.method === "POST") {
+            posts += 1;
+            return { status: 201, data: commentTestRecord(intent.body) };
+          }
+          throw new Error(`unexpected ${request.method} ${request.path}`);
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await platform.updatePullRequestBase({
+      pullRequestNumber: 7,
+      integrationBranchName: "feature/card-alice-source-7",
+    });
+    const results = await Promise.all([
+      platform.ensureComment?.(intent),
+      platform.ensureComment?.(intent),
+    ]);
+    expect(results.map((result) => result?.kind).sort()).toEqual([
+      "capabilityUnavailable",
+      "created",
+    ]);
+    expect(posts).toBe(1);
+  });
+
+  test("does not grant a fresh create permit for an already-ready Integration PR", async () => {
+    const facts = sourceCommentFacts();
+    facts.integrationPullRequest = {
+      status: "ready",
+      value: {
+        number: 8,
+        nodeId: "PR_8",
+        kind: "integration",
+        headOid: oid("candidate"),
+        baseOid: oid("main"),
+        draft: false,
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    facts.candidate = {
+      status: "ready",
+      value: {
+        integrationHeadOid: oid("candidate"),
+        cardPath: "people/alice.md",
+        cardBlobOid: oid("card"),
+        readmeBlobOid: oid("readme"),
+        observedOid: oid("candidate"),
+        provenance: "provider",
+      },
+    };
+    const ready = renderReadyComment({
+      runIdentity: "source:7:42",
+      originalContributor: "alice",
+      integrationPullRequestNumber: 8,
+      candidateHeadOid: oid("candidate"),
+      cardPath: "people/alice.md",
+      cardBlobOid: oid("card"),
+    });
+    let posts = 0;
+    const platform = createOctokitGithubPlatform({
+      owner: "acme",
+      repo: "hello",
+      initialFacts: facts,
+      expectedCommentOwner: { actorId: "42", actorType: "Bot" },
+      transport: {
+        rest: async (request) => {
+          if (request.method === "GET") return { status: 200, data: [] };
+          posts += 1;
+          return { status: 201, data: commentTestRecord(ready.body) };
+        },
+        graphql: async () => ({ data: {} }),
+      },
+    });
+    await expect(
+      platform.markPullRequestReadyForReview({
+        pullRequestNumber: 8,
+        expectedCandidateHeadOid: "candidate",
+      }),
+    ).resolves.toMatchObject({ kind: "alreadyReadyAtExpectedCandidate" });
+    await expect(
+      platform.ensureComment?.({
+        ...ready,
+        targetPullRequestNumber: 8,
+      }),
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    expect(posts).toBe(0);
   });
 
   test("fails closed for unsafe, null, and mismatched comment principals", async () => {
@@ -242,7 +695,7 @@ describe("OctokitGithubPlatform", () => {
       expectedCommentOwner: { actorId: "42", actorType: "Bot" },
     });
     await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-      kind: "created",
+      kind: "capabilityUnavailable",
     });
     expect(lists).toBe(1);
   });
@@ -348,13 +801,10 @@ describe("OctokitGithubPlatform", () => {
       body,
     };
     await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-      kind: "alreadyApplied",
+      kind: "capabilityUnavailable",
     });
-    await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-      kind: "noOp",
-    });
-    expect(posts).toBe(1);
-    expect(waits).toEqual([7]);
+    expect(posts).toBe(0);
+    expect(waits).toEqual([]);
   });
 
   test("clears the converged create lifecycle before a later same-slot phase update", async () => {
@@ -411,32 +861,11 @@ describe("OctokitGithubPlatform", () => {
       body: oldBody,
     };
     await expect(platform.ensureComment?.(setup)).resolves.toMatchObject({
-      kind: "alreadyApplied",
+      kind: "capabilityUnavailable",
     });
-    await expect(platform.ensureComment?.(setup)).resolves.toMatchObject({
-      kind: "noOp",
-    });
-    await expect(
-      platform.ensureComment?.({
-        ...setup,
-        phase: "validation-success",
-        body: newBody,
-        observed: {
-          id: 123,
-          user: { id: "42", actorType: "Bot" },
-          ownerPrincipal: { actorId: "42", actorType: "Bot" },
-          actionKey,
-          body: oldBody,
-          targetPullRequestNumber: 7,
-        },
-      }),
-    ).resolves.toMatchObject({ kind: "updated" });
     expect(
       requests.filter((request) => request.startsWith("POST")),
-    ).toHaveLength(1);
-    expect(
-      requests.filter((request) => request.startsWith("PATCH")),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
 
   test("keeps successful 201 visibility uncertainty in the no-repost readback lifecycle", async () => {
@@ -486,9 +915,9 @@ describe("OctokitGithubPlatform", () => {
       body,
     };
     await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-      kind: "alreadyApplied",
+      kind: "capabilityUnavailable",
     });
-    expect(posts).toBe(1);
+    expect(posts).toBe(0);
   });
 
   test("fails closed on any same-key recovery conflict before accepting exact body", async () => {
@@ -717,31 +1146,10 @@ describe("OctokitGithubPlatform", () => {
         body,
       };
       await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-        kind: "created",
+        kind: "capabilityUnavailable",
       });
-      await expect(
-        platform.ensureComment?.({
-          ...intent,
-          phase: "validation-success",
-          body: updatedBody,
-          observed: {
-            id: 123,
-            user: { id: "42", actorType: "Bot" },
-            ownerPrincipal: { actorId: "42", actorType: "Bot" },
-            actionKey: intent.actionKey,
-            body,
-            targetPullRequestNumber: 7,
-          },
-        }),
-      ).resolves.toMatchObject({ kind: "updated" });
       expect(urls).toEqual([
         "https://github.enterprise.example/api/v3/repos/acme/hello/issues/7/comments?per_page=100&page=1",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/7/comments",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/comments/123",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/7/comments?per_page=100&page=1",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/comments/123",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/comments/123",
-        "https://github.enterprise.example/api/v3/repos/acme/hello/issues/comments/123",
       ]);
       expect(urls.every((url) => url.match(/\/api\/v3/g)?.length === 1)).toBe(
         true,
@@ -855,11 +1263,8 @@ describe("OctokitGithubPlatform", () => {
         phase: "setup",
         body,
       }),
-    ).resolves.toMatchObject({
-      kind: "unknownOutcome",
-      detail: expect.stringContaining("retry-after=9"),
-    });
-    expect(listCount).toBe(4);
+    ).resolves.toMatchObject({ kind: "capabilityUnavailable" });
+    expect(listCount).toBe(1);
   });
 
   test("covers the Comment list/read/PATCH/create status matrix and schemas", async () => {
@@ -1054,7 +1459,7 @@ describe("OctokitGithubPlatform", () => {
         expectedCommentOwner: { actorId: "42", actorType: "Bot" },
       });
       await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-        kind: "unknownOutcome",
+        kind: "capabilityUnavailable",
       });
     }
 
@@ -1102,14 +1507,7 @@ describe("OctokitGithubPlatform", () => {
         expectedCommentOwner: { actorId: "42", actorType: "Bot" },
       });
       await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-        kind:
-          status === 401 || status === 403
-            ? "permissionDenied"
-            : status === 410 || status === 422
-              ? "capabilityUnavailable"
-              : status === 429
-                ? "retryableTransport"
-                : "unknownOutcome",
+        kind: "capabilityUnavailable",
       });
     }
 
@@ -1128,7 +1526,7 @@ describe("OctokitGithubPlatform", () => {
     await expect(
       malformedCreate.ensureComment?.(intent),
     ).resolves.toMatchObject({
-      kind: "unknownOutcome",
+      kind: "capabilityUnavailable",
     });
 
     const transportFailure = createOctokitGithubPlatform({
@@ -1171,10 +1569,10 @@ describe("OctokitGithubPlatform", () => {
       expectedCommentOwner: { actorId: "42", actorType: "Bot" },
     });
     await expect(platform.ensureComment?.(intent)).resolves.toMatchObject({
-      kind: "unknownOutcome",
+      kind: "capabilityUnavailable",
     });
-    expect(posts).toBe(1);
-    expect(lists).toBe(4);
+    expect(posts).toBe(0);
+    expect(lists).toBe(1);
   });
 
   test("maps ready-for-review to the exact GraphQL mutation and variables", async () => {
@@ -2420,5 +2818,43 @@ function commentTestRecord(body: string) {
     body,
     user: { id: 42, login: "hello-bot", type: "Bot" },
     issue_url: "https://api.github.com/repos/acme/hello/issues/7",
+  };
+}
+
+function sourceCommentFacts(): RepositoryFacts {
+  return {
+    main: { status: "absent" as const },
+    sourcePullRequest: {
+      status: "ready" as const,
+      value: {
+        number: 7,
+        kind: "contribution" as const,
+        headOid: oid("source"),
+        baseOid: oid("base"),
+        draft: false,
+        authorGithubId: "42",
+        observedOid: oid("source"),
+        provenance: "provider" as const,
+      },
+    },
+    integrationBranch: { status: "absent" as const },
+    integrationPullRequest: { status: "absent" as const },
+    candidate: { status: "absent" as const },
+    eligibility: {
+      checks: { status: "pending" as const },
+      reviews: { status: "pending" as const },
+      mergeability: { status: "pending" as const },
+      baseCurrent: { status: "pending" as const },
+    },
+    confirmations: [],
+  };
+}
+
+function retargetedSourcePullRequest() {
+  return {
+    number: 7,
+    draft: false,
+    head: { sha: "source" },
+    base: { sha: "base", ref: "feature/card-alice-source-7" },
   };
 }

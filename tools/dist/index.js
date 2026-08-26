@@ -27,7 +27,7 @@ function gitBlobOid(bytes) {
 function commentActionKey(input) {
   if (!input.runIdentity || !Number.isSafeInteger(input.targetPullRequestNumber))
     throw new Error("comment action key inputs are invalid");
-  return `run=${encodeURIComponent(input.runIdentity)};target=${input.targetPullRequestNumber};slot=${input.slot}`;
+  return `run=${input.runIdentity};target=${input.targetPullRequestNumber};slot=${input.slot}`;
 }
 function commentOwnership(fact, expected) {
   if (!expected || !fact.user || !canonicalActorId(expected.actorId) || !canonicalActorId(fact.user.id))
@@ -942,8 +942,10 @@ function createOctokitGithubPlatform(options) {
   let lastFacts = options.initialFacts;
   let activeSignal;
   const apiOrigin = normalizeApiOrigin(options.apiOrigin);
+  const repositoryId = options.repositoryId;
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = /* @__PURE__ */ new Set();
+  const commentCreatePermits = [];
   const path = (suffix) => `/repos/${options.owner}/${options.repo}${suffix}`;
   const apiCommentPath = (suffix) => path(suffix);
   const mergeIntegration = async (request) => {
@@ -1105,10 +1107,10 @@ function createOctokitGithubPlatform(options) {
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return {
+        return grantSetupCommentCreatePermit({
           kind: "succeeded",
           value: { branch: branchFromResponse(response.data, input.name) }
-        };
+        });
       if (response.status === 422) {
         try {
           const branch = await readBranch(input.name);
@@ -1154,20 +1156,20 @@ function createOctokitGithubPlatform(options) {
               (item) => stringValue(asRecord2(item.head).ref) === input.branchName
             ) : void 0;
             if (found)
-              return {
+              return grantSetupCommentCreatePermit({
                 kind: "alreadyApplied",
                 value: { pullRequest: pullRequestFact(found, "integration") }
-              };
+              });
           } catch {
           }
         }
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return {
+        return grantSetupCommentCreatePermit({
           kind: "succeeded",
           value: { pullRequest: pullRequestFact(response.data, "integration") }
-        };
+        });
       return operationFailure(response);
     },
     async updatePullRequestBase(input, context) {
@@ -1189,7 +1191,10 @@ function createOctokitGithubPlatform(options) {
         const updated = pullRequestFact(response.data, "contribution");
         if (updated.baseRef !== input.integrationBranchName)
           return { kind: "stalePrecondition" };
-        return { kind: "succeeded", value: updated };
+        return grantSetupCommentCreatePermit({
+          kind: "succeeded",
+          value: updated
+        });
       }
       return operationFailure(response);
     },
@@ -1226,11 +1231,18 @@ function createOctokitGithubPlatform(options) {
       if (post.headOid !== oid(input.expectedCandidateHeadOid))
         return { kind: "headChanged", observedHeadOid: post.headOid };
       if (post.draft) return { kind: "blocked", reason: "unknownOutcome" };
-      return {
+      const result = {
         kind: "readyAtExpectedCandidate",
         pullRequest: post,
         candidate: state.candidate
       };
+      grantCommentCreatePermit({
+        targetPullRequestNumber: input.pullRequestNumber,
+        slot: "integration-status",
+        phase: "ready-guidance",
+        milestone: "ready"
+      });
+      return result;
     },
     async mergePullRequest(request, context) {
       activeSignal = context?.signal;
@@ -1268,10 +1280,10 @@ function createOctokitGithubPlatform(options) {
         if (owned.length > 1 || matches.length > 0 && owned.length !== matches.length)
           return { kind: "ambiguousOwnership" };
         if (commentLifecycle.has(commentLifecycleKey(intent))) {
-          const recovered = await reconcileAmbiguousCreate(intent, expected);
-          if (recovered.kind !== "unknownOutcome")
-            commentLifecycle.delete(commentLifecycleKey(intent));
-          return recovered;
+          return {
+            kind: "capabilityUnavailable",
+            detail: "comment creation is already reserved in this process"
+          };
         }
         const current = owned[0];
         if (current) {
@@ -1319,6 +1331,11 @@ function createOctokitGithubPlatform(options) {
           );
           return sameIntendedComment(post, intent, expected) ? { kind: "updated", comment: post } : { kind: "stale" };
         }
+        if (!reserveCommentCreatePermit(intent))
+          return {
+            kind: "capabilityUnavailable",
+            detail: "missing same-process durable milestone for comment creation"
+          };
         let response;
         commentLifecycle.add(commentLifecycleKey(intent));
         try {
@@ -1734,7 +1751,8 @@ function createOctokitGithubPlatform(options) {
     let request = {
       method: "GET",
       path: apiCommentPath(`/issues/${pullRequestNumber}/comments`),
-      parameters: { per_page: 100, page: 1 }
+      parameters: { per_page: 100, page: 1 },
+      headers: { "cache-control": "no-cache" }
     };
     for (let page = 0; page < COMMENT_PAGE_BUDGET; page += 1) {
       const response = await requestCommentRest(request, [200], "read");
@@ -1758,7 +1776,8 @@ function createOctokitGithubPlatform(options) {
         request,
         pullRequestNumber,
         apiCommentPath,
-        apiOrigin
+        apiOrigin,
+        repositoryId
       );
       if (next.kind === "terminal") return deduplicateComments(all);
       if (next.kind === "malformed")
@@ -1772,7 +1791,11 @@ function createOctokitGithubPlatform(options) {
           "cyclic issue comments pagination"
         );
       seenUrls.add(next.url);
-      request = { method: "GET", path: next.url };
+      request = {
+        method: "GET",
+        path: next.url,
+        headers: { "cache-control": "no-cache" }
+      };
     }
     throw new OctokitOperationError(
       "unknownOutcome",
@@ -1781,7 +1804,11 @@ function createOctokitGithubPlatform(options) {
   }
   async function readIssueComment(commentId, pullRequestNumber) {
     const response = await requestCommentRest(
-      { method: "GET", path: apiCommentPath(`/issues/comments/${commentId}`) },
+      {
+        method: "GET",
+        path: apiCommentPath(`/issues/comments/${commentId}`),
+        headers: { "cache-control": "no-cache" }
+      },
       [200],
       "read"
     );
@@ -1860,6 +1887,35 @@ function createOctokitGithubPlatform(options) {
       );
     }
   }
+  function grantSetupCommentCreatePermit(result) {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    if (source)
+      grantCommentCreatePermit({
+        targetPullRequestNumber: source.number,
+        slot: "source-status",
+        phase: "setup",
+        milestone: "setup"
+      });
+    return result;
+  }
+  function grantCommentCreatePermit(input) {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    if (!source?.authorGithubId) return;
+    commentCreatePermits.push({
+      runIdentity: `source:${source.number}:${source.authorGithubId}`,
+      ...input
+    });
+  }
+  function reserveCommentCreatePermit(intent) {
+    if (intent.phase === "completion") return false;
+    const key2 = parseCommentActionKey(intent.actionKey);
+    const index = commentCreatePermits.findIndex(
+      (permit) => key2 !== void 0 && key2.runIdentity === permit.runIdentity && key2.targetPullRequestNumber === permit.targetPullRequestNumber && key2.slot === permit.slot && intent.targetPullRequestNumber === permit.targetPullRequestNumber && intent.slot === permit.slot && intent.phase === permit.phase && milestoneForCommentPhase(intent.phase) === permit.milestone
+    );
+    if (index < 0) return false;
+    commentCreatePermits.splice(index, 1);
+    return true;
+  }
   async function findIntegrationBranch(expectedName) {
     const response = await requestRest(
       { method: "GET", path: path("/git/matching-refs/heads/feature/card-") },
@@ -1927,6 +1983,11 @@ function createOctokitGithubPlatform(options) {
     }
   }
 }
+function milestoneForCommentPhase(phase) {
+  if (phase === "setup") return "setup";
+  if (phase === "ready-guidance") return "ready";
+  return void 0;
+}
 var COMMENT_PAGE_BUDGET = 8;
 function normalizeApiOrigin(value) {
   const parsed = new URL(value ?? "https://api.github.com");
@@ -1942,6 +2003,18 @@ function boundedReadbackAttempts(value) {
 }
 function commentLifecycleKey(intent) {
   return `${intent.targetPullRequestNumber}:${intent.actionKey}`;
+}
+function parseCommentActionKey(value) {
+  const match = /^run=([^;]+);target=([1-9][0-9]*);slot=(source-status|integration-status)$/u.exec(
+    value
+  );
+  if (!match?.[1] || !match[2] || !match[3]) return void 0;
+  const targetPullRequestNumber = Number(match[2]);
+  return Number.isSafeInteger(targetPullRequestNumber) ? {
+    runIdentity: match[1],
+    targetPullRequestNumber,
+    slot: match[3]
+  } : void 0;
 }
 async function waitForCommentReadback(options) {
   if (!options?.sleep) return;
@@ -2185,7 +2258,7 @@ function deduplicateComments(comments) {
   }
   return [...byId.values()];
 }
-function nextCommentPage(raw, current, target, repositoryPath, trustedOrigin) {
+function nextCommentPage(raw, current, target, repositoryPath, trustedOrigin, repositoryId) {
   if (raw === void 0) return { kind: "terminal" };
   if (raw.trim().length === 0) return { kind: "malformed" };
   const entries = raw.split(",").map((entry) => entry.trim());
@@ -2212,12 +2285,24 @@ function nextCommentPage(raw, current, target, repositoryPath, trustedOrigin) {
     const currentUrl = new URL(
       typeof current.path === "string" && current.path.startsWith("http") ? current.path : `${trustedOrigin.origin}${current.path.startsWith(trustedApiPath(trustedOrigin)) ? current.path : `${trustedApiPath(trustedOrigin)}${current.path}`}`
     );
-    if (url.origin !== trustedOrigin.origin || currentUrl.origin !== trustedOrigin.origin || url.pathname !== `${trustedApiPath(trustedOrigin)}${repositoryPath(`/issues/${target}/comments`)}` || !positiveInteger(url.searchParams.get("page")) || !positiveInteger(currentUrl.searchParams.get("page") ?? "1") || Number(url.searchParams.get("page")) <= Number(currentUrl.searchParams.get("page") ?? "1"))
+    if (url.origin !== trustedOrigin.origin || currentUrl.origin !== trustedOrigin.origin || !trustedCommentListPath(
+      url.pathname,
+      target,
+      repositoryPath,
+      trustedOrigin,
+      repositoryId
+    ) || !positiveInteger(url.searchParams.get("page")) || !positiveInteger(currentUrl.searchParams.get("page") ?? "1") || Number(url.searchParams.get("page")) <= Number(currentUrl.searchParams.get("page") ?? "1"))
       return { kind: "malformed" };
     return { kind: "next", url: url.toString() };
   } catch {
     return { kind: "malformed" };
   }
+}
+function trustedCommentListPath(pathname, target, repositoryPath, trustedOrigin, repositoryId) {
+  const apiPath = trustedApiPath(trustedOrigin);
+  if (pathname === `${apiPath}${repositoryPath(`/issues/${target}/comments`)}`)
+    return true;
+  return repositoryId !== void 0 && pathname === `${apiPath}/repositories/${repositoryId}/issues/${target}/comments`;
 }
 function positiveInteger(value) {
   return value !== null && /^[1-9][0-9]*$/u.test(value);
@@ -2485,7 +2570,7 @@ function rendered(actionKey, slot, phase, lines) {
     actionKey,
     slot,
     phase,
-    body: `<!-- ${MARKER}: key=${escapeMarker(actionKey)} phase=${phase} -->
+    body: `<!-- ${MARKER}: key=${encodeURIComponent(actionKey)} phase=${phase} -->
 ${lines.join("\n")}
 `
   };
@@ -2493,10 +2578,6 @@ ${lines.join("\n")}
 function escapeInline(value) {
   assertSafeText(value);
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-function escapeMarker(value) {
-  assertSafeText(value);
-  return value.replaceAll("--", "- -").replaceAll("<", "%3C").replaceAll(">", "%3E");
 }
 function assertSafeText(value) {
   if (/[`\\[\]()!#*_~|]/u.test(value))
@@ -2933,6 +3014,13 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
   if (candidate && integration?.draft && candidate.integrationHeadOid === integration.headOid) {
     if (!candidate.retainedCommitOids || !candidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids)
       return awaitingIncomplete();
+    return {
+      kind: "ready",
+      pullRequestNumber: integration.number,
+      candidateHeadOid: candidate.integrationHeadOid
+    };
+  }
+  if (candidate && !integration?.draft && candidate.integrationHeadOid === integration.headOid) {
     const readyComment = commentsSupported ? commentEffect(
       facts,
       integration.number,
@@ -2948,11 +3036,6 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
       })
     ) : void 0;
     if (readyComment) return readyComment;
-    return {
-      kind: "ready",
-      pullRequestNumber: integration.number,
-      candidateHeadOid: candidate.integrationHeadOid
-    };
   }
   if (confirmation && integration && candidate && candidate.integrationHeadOid === integration.headOid && providerEligible(facts, integration.number, integration.headOid)) {
     if (!candidate.retainedCommitOids || !candidate.requiredParentOids || !workspace.retainedCommitOids || !workspace.requiredParentOids || !main.readmeBytes || !source.mergeCommitOid || !facts.protocolAnchors?.contribution)
@@ -3364,8 +3447,11 @@ function createActionComposition(input) {
   const reconciler = createReconciler(input);
   return {
     context: input.context,
-    run(budget) {
-      return reconciler.reconcile({ budget });
+    run(budget, onDiagnostic) {
+      return reconciler.reconcile({
+        budget,
+        ...onDiagnostic ? { onDiagnostic } : {}
+      });
     }
   };
 }
@@ -3438,7 +3524,8 @@ async function runTrustedAction() {
   const context = await createTrustedActionContext({ defaultBranch });
   const [owner, repo] = context.repository.split("/");
   if (!owner || !repo) throw new Error("GITHUB_REPOSITORY must be owner/repo");
-  const apiOrigin = process.env.HELLO_FROM_MAIN_API_ORIGIN;
+  const runtimeIdentity = resolveRuntimeIdentity(process.env);
+  const apiOrigin = runtimeIdentity.apiOrigin;
   const transport = createGithubTransport(token, apiOrigin);
   const anchors = context.eventName === "schedule" ? await discoverActiveRunAnchors({ owner, repo, transport }) : [
     {
@@ -3483,6 +3570,21 @@ async function runProductionComposition(input) {
     expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
     expectedSourceLogin: runtime.sourceLogin
   };
+  let repositoryId;
+  try {
+    repositoryId = await trustedRepositoryId(transport, owner, repo);
+  } catch {
+    process.stdout.write(
+      `${JSON.stringify({
+        kind: "hello-from-main-diagnostic",
+        stage: "pre-composition",
+        outcome: "terminal",
+        reason: "capabilityUnavailable"
+      })}
+`
+    );
+    throw new Error("trusted repository identity is unavailable");
+  }
   const composition = createActionComposition({
     context,
     github: bindProductionSetup(
@@ -3491,6 +3593,7 @@ async function runProductionComposition(input) {
         repo,
         transport,
         ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
+        repositoryId,
         expectedCommentOwner: runtime.commentOwner
       }),
       runtime,
@@ -3511,12 +3614,37 @@ async function runProductionComposition(input) {
     invocationContext: sourceContext
   });
   try {
-    const outcome = await composition.run({ maxEffects: 8 });
+    const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
+      process.stdout.write(
+        `${JSON.stringify({
+          kind: "hello-from-main-diagnostic",
+          turn: diagnostic.turn,
+          ...diagnostic.effect ? { effect: diagnostic.effect } : {},
+          outcome: diagnostic.outcome.kind,
+          ...diagnostic.outcome.kind === "retryable" || diagnostic.outcome.kind === "terminal" || diagnostic.outcome.kind === "awaitingExternalFact" ? { reason: diagnostic.outcome.reason } : {}
+        })}
+`
+      );
+    });
     process.stdout.write(`${JSON.stringify(outcome)}
 `);
+    if (outcome.kind === "retryable" || outcome.kind === "terminal" || outcome.kind === "budgetExhausted")
+      throw new Error(`Hello from Main action failed: ${outcome.kind}`);
   } finally {
     await gitAuth.dispose();
   }
+}
+async function trustedRepositoryId(transport, owner, repo) {
+  const response = await transport.rest({
+    method: "GET",
+    path: `/repos/${owner}/${repo}`
+  });
+  const id = response.data && typeof response.data === "object" ? response.data.id : void 0;
+  if (response.status !== 200 || typeof id !== "number" || !Number.isSafeInteger(id) || id < 1)
+    throw new Error(
+      "trusted repository numeric ID is required for comment pagination"
+    );
+  return id;
 }
 function deriveIntegrationRuntimeConfig(input) {
   const number = input.context.sourcePullRequest?.number ?? Number(input.env.HELLO_FROM_MAIN_SOURCE_PR_NUMBER);
@@ -3535,14 +3663,17 @@ function deriveIntegrationRuntimeConfig(input) {
     );
   const commentOwnerId = input.env.HELLO_FROM_MAIN_COMMENT_OWNER_ID;
   const commentOwnerType = input.env.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE;
-  const apiOrigin = input.env.HELLO_FROM_MAIN_API_ORIGIN;
-  if (!commentOwnerId || commentOwnerType !== "Bot" && commentOwnerType !== "User" || !/^[1-9][0-9]*$/u.test(commentOwnerId))
+  const runtimeIdentity = resolveRuntimeIdentity(input.env);
+  const publicGithub = runtimeIdentity.publicGithub;
+  const configuredCommentOwnerId = commentOwnerId ?? (publicGithub ? "41898282" : void 0);
+  const configuredCommentOwnerType = commentOwnerType ?? (publicGithub ? "Bot" : void 0);
+  if (!configuredCommentOwnerId || configuredCommentOwnerType !== "Bot" && configuredCommentOwnerType !== "User" || !/^[1-9][0-9]*$/u.test(configuredCommentOwnerId))
     throw new Error(
       "comment owner principal requires a canonical ID and exact actor type"
     );
   const commentOwner = {
-    actorId: commentOwnerId,
-    actorType: commentOwnerType
+    actorId: configuredCommentOwnerId,
+    actorType: configuredCommentOwnerType
   };
   return {
     remote: input.env.HELLO_FROM_MAIN_REMOTE || "origin",
@@ -3550,8 +3681,38 @@ function deriveIntegrationRuntimeConfig(input) {
     sourcePullRequestNumber: number,
     sourceLogin: login,
     commentOwner,
-    ...apiOrigin ? { apiOrigin } : {}
+    apiOrigin: runtimeIdentity.apiOrigin
   };
+}
+function resolveRuntimeIdentity(env) {
+  const standardApi = env.GITHUB_API_URL;
+  const standardServer = env.GITHUB_SERVER_URL;
+  const custom = env.HELLO_FROM_MAIN_API_ORIGIN;
+  const customOrigin = custom ? normalizeOrigin(custom) : void 0;
+  const apiOrigin = normalizeOrigin(standardApi ?? "https://api.github.com");
+  const serverOrigin = normalizeOrigin(standardServer ?? "https://github.com");
+  if (!trustedApiMatchesServer(apiOrigin, serverOrigin))
+    throw new Error("trusted GitHub API and server origins are not coherent");
+  if (customOrigin && !sameApiOrigin(customOrigin, apiOrigin))
+    throw new Error(
+      "custom API origin must be coherent with the trusted runtime"
+    );
+  const effectiveApi = customOrigin ?? apiOrigin;
+  const publicGithub = effectiveApi === "https://api.github.com" && serverOrigin === "https://github.com";
+  return { apiOrigin: effectiveApi, publicGithub };
+}
+function normalizeOrigin(value) {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/+$/u, "");
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/u, "");
+}
+function sameApiOrigin(left, right) {
+  return left === right;
+}
+function trustedApiMatchesServer(apiOrigin, serverOrigin) {
+  return apiOrigin === "https://api.github.com" && serverOrigin === "https://github.com" || new URL(apiOrigin).origin === serverOrigin;
 }
 function bindProductionSetup(github, runtime, workspace) {
   return {
@@ -3650,6 +3811,7 @@ function createGithubTransport(token, apiOrigin = "https://api.github.com") {
           method: request.method,
           headers: {
             ...headers,
+            ...request.headers,
             ...request.method === "GET" ? {} : { "content-type": "application/json" }
           },
           ...request.method === "GET" ? {} : { body: JSON.stringify(request.parameters ?? {}) },

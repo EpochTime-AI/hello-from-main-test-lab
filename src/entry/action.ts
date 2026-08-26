@@ -25,8 +25,18 @@ export function createActionComposition(input: {
   const reconciler = createReconciler(input);
   return {
     context: input.context,
-    run(budget: ReconcileBudget): Promise<ReconcileOutcome> {
-      return reconciler.reconcile({ budget });
+    run(
+      budget: ReconcileBudget,
+      onDiagnostic?: (diagnostic: {
+        turn: number;
+        effect?: string;
+        outcome: ReconcileOutcome;
+      }) => void,
+    ): Promise<ReconcileOutcome> {
+      return reconciler.reconcile({
+        budget,
+        ...(onDiagnostic ? { onDiagnostic } : {}),
+      });
     },
   };
 }

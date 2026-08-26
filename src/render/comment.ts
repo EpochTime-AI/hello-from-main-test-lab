@@ -153,7 +153,7 @@ function rendered(
     actionKey,
     slot,
     phase,
-    body: `<!-- ${MARKER}: key=${escapeMarker(actionKey)} phase=${phase} -->\n${lines.join("\n")}\n`,
+    body: `<!-- ${MARKER}: key=${encodeURIComponent(actionKey)} phase=${phase} -->\n${lines.join("\n")}\n`,
   };
 }
 
@@ -163,14 +163,6 @@ function escapeInline(value: string): string {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
-}
-
-function escapeMarker(value: string): string {
-  assertSafeText(value);
-  return value
-    .replaceAll("--", "- -")
-    .replaceAll("<", "%3C")
-    .replaceAll(">", "%3E");
 }
 
 function assertSafeText(value: string): void {

@@ -244,7 +244,7 @@ export function commentActionKey(input: {
     !Number.isSafeInteger(input.targetPullRequestNumber)
   )
     throw new Error("comment action key inputs are invalid");
-  return `run=${encodeURIComponent(input.runIdentity)};target=${input.targetPullRequestNumber};slot=${input.slot}`;
+  return `run=${input.runIdentity};target=${input.targetPullRequestNumber};slot=${input.slot}`;
 }
 
 export function commentOwnership(

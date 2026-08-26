@@ -36,7 +36,8 @@ export async function runTrustedAction(): Promise<void> {
   const context = await createTrustedActionContext({ defaultBranch });
   const [owner, repo] = context.repository.split("/");
   if (!owner || !repo) throw new Error("GITHUB_REPOSITORY must be owner/repo");
-  const apiOrigin = process.env.HELLO_FROM_MAIN_API_ORIGIN;
+  const runtimeIdentity = resolveRuntimeIdentity(process.env);
+  const apiOrigin = runtimeIdentity.apiOrigin;
   const transport = createGithubTransport(token, apiOrigin);
   const anchors =
     context.eventName === "schedule"
@@ -93,6 +94,20 @@ async function runProductionComposition(input: {
     expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
     expectedSourceLogin: runtime.sourceLogin,
   };
+  let repositoryId: number;
+  try {
+    repositoryId = await trustedRepositoryId(transport, owner, repo);
+  } catch {
+    process.stdout.write(
+      `${JSON.stringify({
+        kind: "hello-from-main-diagnostic",
+        stage: "pre-composition",
+        outcome: "terminal",
+        reason: "capabilityUnavailable",
+      })}\n`,
+    );
+    throw new Error("trusted repository identity is unavailable");
+  }
   const composition = createActionComposition({
     context,
     github: bindProductionSetup(
@@ -101,6 +116,7 @@ async function runProductionComposition(input: {
         repo,
         transport,
         ...(runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {}),
+        repositoryId,
         expectedCommentOwner: runtime.commentOwner,
       }),
       runtime,
@@ -121,11 +137,56 @@ async function runProductionComposition(input: {
     invocationContext: sourceContext,
   });
   try {
-    const outcome = await composition.run({ maxEffects: 8 });
+    const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
+      process.stdout.write(
+        `${JSON.stringify({
+          kind: "hello-from-main-diagnostic",
+          turn: diagnostic.turn,
+          ...(diagnostic.effect ? { effect: diagnostic.effect } : {}),
+          outcome: diagnostic.outcome.kind,
+          ...(diagnostic.outcome.kind === "retryable" ||
+          diagnostic.outcome.kind === "terminal" ||
+          diagnostic.outcome.kind === "awaitingExternalFact"
+            ? { reason: diagnostic.outcome.reason }
+            : {}),
+        })}\n`,
+      );
+    });
     process.stdout.write(`${JSON.stringify(outcome)}\n`);
+    if (
+      outcome.kind === "retryable" ||
+      outcome.kind === "terminal" ||
+      outcome.kind === "budgetExhausted"
+    )
+      throw new Error(`Hello from Main action failed: ${outcome.kind}`);
   } finally {
     await gitAuth.dispose();
   }
+}
+
+async function trustedRepositoryId(
+  transport: OctokitRequestTransport,
+  owner: string,
+  repo: string,
+): Promise<number> {
+  const response = await transport.rest({
+    method: "GET",
+    path: `/repos/${owner}/${repo}`,
+  });
+  const id =
+    response.data && typeof response.data === "object"
+      ? (response.data as { id?: unknown }).id
+      : undefined;
+  if (
+    response.status !== 200 ||
+    typeof id !== "number" ||
+    !Number.isSafeInteger(id) ||
+    id < 1
+  )
+    throw new Error(
+      "trusted repository numeric ID is required for comment pagination",
+    );
+  return id;
 }
 
 export type IntegrationRuntimeConfig = {
@@ -162,18 +223,24 @@ export function deriveIntegrationRuntimeConfig(input: {
     );
   const commentOwnerId = input.env.HELLO_FROM_MAIN_COMMENT_OWNER_ID;
   const commentOwnerType = input.env.HELLO_FROM_MAIN_COMMENT_OWNER_TYPE;
-  const apiOrigin = input.env.HELLO_FROM_MAIN_API_ORIGIN;
+  const runtimeIdentity = resolveRuntimeIdentity(input.env);
+  const publicGithub = runtimeIdentity.publicGithub;
+  const configuredCommentOwnerId =
+    commentOwnerId ?? (publicGithub ? "41898282" : undefined);
+  const configuredCommentOwnerType =
+    commentOwnerType ?? (publicGithub ? "Bot" : undefined);
   if (
-    !commentOwnerId ||
-    (commentOwnerType !== "Bot" && commentOwnerType !== "User") ||
-    !/^[1-9][0-9]*$/u.test(commentOwnerId)
+    !configuredCommentOwnerId ||
+    (configuredCommentOwnerType !== "Bot" &&
+      configuredCommentOwnerType !== "User") ||
+    !/^[1-9][0-9]*$/u.test(configuredCommentOwnerId)
   )
     throw new Error(
       "comment owner principal requires a canonical ID and exact actor type",
     );
   const commentOwner: TrustedPrincipal = {
-    actorId: commentOwnerId,
-    actorType: commentOwnerType,
+    actorId: configuredCommentOwnerId,
+    actorType: configuredCommentOwnerType,
   };
   return {
     remote: input.env.HELLO_FROM_MAIN_REMOTE || "origin",
@@ -181,8 +248,54 @@ export function deriveIntegrationRuntimeConfig(input: {
     sourcePullRequestNumber: number,
     sourceLogin: login,
     commentOwner,
-    ...(apiOrigin ? { apiOrigin } : {}),
+    apiOrigin: runtimeIdentity.apiOrigin,
   };
+}
+
+function resolveRuntimeIdentity(env: NodeJS.ProcessEnv): {
+  apiOrigin: string;
+  publicGithub: boolean;
+} {
+  const standardApi = env.GITHUB_API_URL;
+  const standardServer = env.GITHUB_SERVER_URL;
+  const custom = env.HELLO_FROM_MAIN_API_ORIGIN;
+  const customOrigin = custom ? normalizeOrigin(custom) : undefined;
+  const apiOrigin = normalizeOrigin(standardApi ?? "https://api.github.com");
+  const serverOrigin = normalizeOrigin(standardServer ?? "https://github.com");
+  if (!trustedApiMatchesServer(apiOrigin, serverOrigin))
+    throw new Error("trusted GitHub API and server origins are not coherent");
+  if (customOrigin && !sameApiOrigin(customOrigin, apiOrigin))
+    throw new Error(
+      "custom API origin must be coherent with the trusted runtime",
+    );
+  const effectiveApi = customOrigin ?? apiOrigin;
+  const publicGithub =
+    effectiveApi === "https://api.github.com" &&
+    serverOrigin === "https://github.com";
+  return { apiOrigin: effectiveApi, publicGithub };
+}
+
+function normalizeOrigin(value: string): string {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/+$/u, "");
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/u, "");
+}
+
+function sameApiOrigin(left: string, right: string): boolean {
+  return left === right;
+}
+
+function trustedApiMatchesServer(
+  apiOrigin: string,
+  serverOrigin: string,
+): boolean {
+  return (
+    (apiOrigin === "https://api.github.com" &&
+      serverOrigin === "https://github.com") ||
+    new URL(apiOrigin).origin === serverOrigin
+  );
 }
 
 function bindProductionSetup(
@@ -298,6 +411,7 @@ export function createGithubTransport(
           method: request.method,
           headers: {
             ...headers,
+            ...request.headers,
             ...(request.method === "GET"
               ? {}
               : { "content-type": "application/json" }),

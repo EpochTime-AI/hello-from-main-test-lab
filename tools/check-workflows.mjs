@@ -184,7 +184,7 @@ for (const file of files) {
       "HELLO_FROM_MAIN_COMMENT_OWNER_ID",
       "HELLO_FROM_MAIN_COMMENT_OWNER_TYPE",
     ])
-      if (!source.includes(`${name}: \${{ vars.${name} }}`))
+      if (!source.includes(`${name}: \${{ vars.${name} || (github.server_url == 'https://github.com'`))
         throw new Error(`${file} must wire ${name} from a repository variable`);
   }
 }

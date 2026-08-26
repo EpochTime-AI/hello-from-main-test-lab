@@ -582,6 +582,17 @@ function deriveEffect(
       !workspace.requiredParentOids
     )
       return awaitingIncomplete();
+    return {
+      kind: "ready",
+      pullRequestNumber: integration.number,
+      candidateHeadOid: candidate.integrationHeadOid,
+    };
+  }
+  if (
+    candidate &&
+    !integration?.draft &&
+    candidate.integrationHeadOid === integration.headOid
+  ) {
     const readyComment = commentsSupported
       ? commentEffect(
           facts,
@@ -599,11 +610,6 @@ function deriveEffect(
         )
       : undefined;
     if (readyComment) return readyComment;
-    return {
-      kind: "ready",
-      pullRequestNumber: integration.number,
-      candidateHeadOid: candidate.integrationHeadOid,
-    };
   }
   if (
     confirmation &&
