@@ -120,26 +120,44 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 function createGitAuthenticationEnv(input) {
   if (!input.token) throw new Error("Git authentication token is required");
-  const askpass = join(input.root, "git-askpass.sh");
   return {
     env: {
-      GIT_ASKPASS: askpass,
+      GIT_ASKPASS: input.helperPath,
       GIT_TERMINAL_PROMPT: "0",
       HELLO_FROM_MAIN_GIT_TOKEN: input.token
     },
-    dispose: async () => rm(askpass, { force: true })
+    // This low-level constructor owns no filesystem resource.
+    dispose: async () => void 0
   };
 }
 async function installGitAuthentication(input) {
-  const auth = createGitAuthenticationEnv(input);
-  await mkdir(input.root, { recursive: true });
-  await writeFile(
-    join(input.root, "git-askpass.sh"),
-    '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
-    { mode: 448 }
-  );
-  await chmod(join(input.root, "git-askpass.sh"), 448);
-  return auth;
+  let directory;
+  try {
+    directory = await mkdtemp(join(tmpdir(), "hello-from-main-git-auth-"));
+    await chmod(directory, 448);
+    const askpass = join(directory, "git-askpass.sh");
+    const auth = createGitAuthenticationEnv({
+      token: input.token,
+      helperPath: askpass
+    });
+    await writeFile(
+      askpass,
+      '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
+      { mode: 448 }
+    );
+    await chmod(askpass, 448);
+    return {
+      ...auth,
+      // This disposer owns the directory allocated by this installation.
+      dispose: async () => rm(directory, { force: true, recursive: true })
+    };
+  } catch (error) {
+    if (directory)
+      await rm(directory, { force: true, recursive: true }).catch(
+        () => void 0
+      );
+    throw error;
+  }
 }
 function createGitRunner(input) {
   return {
@@ -236,6 +254,10 @@ async function runGit(root, argv, options) {
 }
 async function git(runner, cwd, ...argv) {
   return (await runner.run(argv, { cwd })).stdout.trim();
+}
+function gitCommandFailureDetail(error) {
+  const operation = error.result.argv[0] ?? "unknown";
+  return `operation=${operation}; status=${error.result.status}; category=local-git`;
 }
 function oidFromBytes(bytes) {
   const header = Buffer.from(`blob ${bytes.byteLength}\0`);
@@ -666,6 +688,14 @@ var init_git = __esm({
           );
           if (observedMain !== candidate.input.observedMainOid)
             return { kind: "staleMain" };
+          const existing = await this.readWorkspace().catch(() => void 0);
+          if (existing?.value && await candidateMatches(
+            this.runner,
+            this.cwd,
+            existing.value,
+            candidate
+          ))
+            return { kind: "alreadyApplied", value: existing.value };
           if (!await isAncestor(this.runner, this.cwd, observedMain, current)) {
             await git(
               this.runner,
@@ -696,39 +726,38 @@ var init_git = __esm({
             candidate.input.cardPath,
             "README.md"
           );
-          if (await git(this.runner, this.cwd, "status", "--short")) {
-            const candidateParentOid = oid(
-              await git(this.runner, this.cwd, "rev-parse", "HEAD")
-            );
+          const candidateParentOid = oid(
+            await git(this.runner, this.cwd, "rev-parse", "HEAD")
+          );
+          await git(
+            this.runner,
+            this.cwd,
+            "commit",
+            "--allow-empty",
+            "--message",
+            "Build candidate Card",
+            "--message",
+            candidateCommitTrailers(candidate, candidateParentOid)
+          );
+          try {
             await git(
               this.runner,
               this.cwd,
-              "commit",
-              "--message",
-              "Build candidate Card",
-              "--message",
-              candidateCommitTrailers(candidate, candidateParentOid)
+              "push",
+              "--force-with-lease",
+              this.remote,
+              `${this.branch}:${this.branch}`
             );
-            try {
-              await git(
-                this.runner,
-                this.cwd,
-                "push",
-                "--force-with-lease",
-                this.remote,
-                `${this.branch}:${this.branch}`
-              );
-            } catch {
-              const readback2 = await this.readWorkspace().catch(() => void 0);
-              if (readback2?.value && await candidateMatches(
-                this.runner,
-                this.cwd,
-                readback2.value,
-                candidate
-              ))
-                return { kind: "alreadyApplied", value: readback2.value };
-              return { kind: "retryableTransport" };
-            }
+          } catch {
+            const readback2 = await this.readWorkspace().catch(() => void 0);
+            if (readback2?.value && await candidateMatches(
+              this.runner,
+              this.cwd,
+              readback2.value,
+              candidate
+            ))
+              return { kind: "alreadyApplied", value: readback2.value };
+            return { kind: "retryableTransport" };
           }
           const head = oid(await git(this.runner, this.cwd, "rev-parse", "HEAD"));
           const cardBlob = oid(
@@ -806,8 +835,11 @@ var init_git = __esm({
             retainedCommitOids
           };
           return { kind: "succeeded", value: readback };
-        } catch {
-          return { kind: "unknownOutcome" };
+        } catch (error) {
+          return {
+            kind: "unknownOutcome",
+            ...error instanceof GitCommandError ? { detail: gitCommandFailureDetail(error) } : {}
+          };
         }
       }
       async readFinalMainPostconditions(expected, context) {
@@ -4101,55 +4133,55 @@ async function runProductionComposition(input) {
     root: workspace,
     token
   });
-  const sourceContext = {
-    signal: new AbortController().signal,
-    expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
-    expectedSourceLogin: runtime.sourceLogin
-  };
-  let repositoryId;
   try {
-    repositoryId = await trustedRepositoryId(transport, owner, repo);
-  } catch {
-    process.stdout.write(
-      `${JSON.stringify({
-        kind: "hello-from-main-diagnostic",
-        stage: "pre-composition",
-        outcome: "terminal",
-        reason: "capabilityUnavailable"
-      })}
+    const sourceContext = {
+      signal: new AbortController().signal,
+      expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
+      expectedSourceLogin: runtime.sourceLogin
+    };
+    let repositoryId;
+    try {
+      repositoryId = await trustedRepositoryId(transport, owner, repo);
+    } catch {
+      process.stdout.write(
+        `${JSON.stringify({
+          kind: "hello-from-main-diagnostic",
+          stage: "pre-composition",
+          outcome: "terminal",
+          reason: "capabilityUnavailable"
+        })}
 `
-    );
-    throw new Error("trusted repository identity is unavailable");
-  }
-  const composition = createActionComposition({
-    context,
-    github: bindProductionSetup(
-      createOctokitGithubPlatform({
-        owner,
-        repo,
-        transport,
-        ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
-        repositoryId,
-        expectedCommentOwner: runtime.commentOwner
-      }),
-      runtime,
-      new RealGitWorkspace(
+      );
+      throw new Error("trusted repository identity is unavailable");
+    }
+    const composition = createActionComposition({
+      context,
+      github: bindProductionSetup(
+        createOctokitGithubPlatform({
+          owner,
+          repo,
+          transport,
+          ...runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {},
+          repositoryId,
+          expectedCommentOwner: runtime.commentOwner
+        }),
+        runtime,
+        new RealGitWorkspace(
+          createGitRunner({ root: workspace, env: gitAuth.env }),
+          workspace,
+          runtime.remote,
+          runtime.branch
+        )
+      ),
+      git: new RealGitWorkspace(
         createGitRunner({ root: workspace, env: gitAuth.env }),
         workspace,
         runtime.remote,
         runtime.branch
-      )
-    ),
-    git: new RealGitWorkspace(
-      createGitRunner({ root: workspace, env: gitAuth.env }),
-      workspace,
-      runtime.remote,
-      runtime.branch
-    ),
-    candidatePolicy: productionCandidatePolicy,
-    invocationContext: sourceContext
-  });
-  try {
+      ),
+      candidatePolicy: productionCandidatePolicy,
+      invocationContext: sourceContext
+    });
     const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
       process.stdout.write(
         `${JSON.stringify({

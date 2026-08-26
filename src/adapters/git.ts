@@ -84,35 +84,55 @@ export type GitAuthentication = {
 };
 
 export function createGitAuthenticationEnv(
-  input: GitAuthentication & { root: string },
+  input: GitAuthentication & { helperPath: string },
 ): {
   env: Record<string, string>;
   dispose: () => Promise<void>;
 } {
   if (!input.token) throw new Error("Git authentication token is required");
-  const askpass = join(input.root, "git-askpass.sh");
   return {
     env: {
-      GIT_ASKPASS: askpass,
+      GIT_ASKPASS: input.helperPath,
       GIT_TERMINAL_PROMPT: "0",
       HELLO_FROM_MAIN_GIT_TOKEN: input.token,
     },
-    dispose: async () => rm(askpass, { force: true }),
+    // This low-level constructor owns no filesystem resource.
+    dispose: async () => undefined,
   };
 }
 
 export async function installGitAuthentication(
-  input: GitAuthentication & { root: string },
+  input: GitAuthentication & { root?: string },
 ) {
-  const auth = createGitAuthenticationEnv(input);
-  await mkdir(input.root, { recursive: true });
-  await writeFile(
-    join(input.root, "git-askpass.sh"),
-    '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
-    { mode: 0o700 },
-  );
-  await chmod(join(input.root, "git-askpass.sh"), 0o700);
-  return auth;
+  // Authentication material must not share a repository's worktree.
+  let directory: string | undefined;
+  try {
+    directory = await mkdtemp(join(tmpdir(), "hello-from-main-git-auth-"));
+    await chmod(directory, 0o700);
+    const askpass = join(directory, "git-askpass.sh");
+    const auth = createGitAuthenticationEnv({
+      token: input.token,
+      helperPath: askpass,
+    });
+    await writeFile(
+      askpass,
+      '#!/bin/sh\ncase "$1" in\n  *Username*) printf "x-access-token\\n" ;;\n  *Password*) printf "%s\\n" "$HELLO_FROM_MAIN_GIT_TOKEN" ;;\n  *) exit 1 ;;\nesac\n',
+      { mode: 0o700 },
+    );
+    await chmod(askpass, 0o700);
+    return {
+      ...auth,
+      // This disposer owns the directory allocated by this installation.
+      dispose: async () =>
+        rm(directory as string, { force: true, recursive: true }),
+    };
+  } catch (error) {
+    if (directory)
+      await rm(directory, { force: true, recursive: true }).catch(
+        () => undefined,
+      );
+    throw error;
+  }
 }
 
 let nextCommand = 0;
@@ -473,6 +493,17 @@ export class RealGitWorkspace {
       );
       if (observedMain !== candidate.input.observedMainOid)
         return { kind: "staleMain" };
+      const existing = await this.readWorkspace().catch(() => undefined);
+      if (
+        existing?.value &&
+        (await candidateMatches(
+          this.runner,
+          this.cwd,
+          existing.value,
+          candidate,
+        ))
+      )
+        return { kind: "alreadyApplied", value: existing.value };
       if (!(await isAncestor(this.runner, this.cwd, observedMain, current))) {
         await git(
           this.runner,
@@ -504,42 +535,41 @@ export class RealGitWorkspace {
         candidate.input.cardPath,
         "README.md",
       );
-      if (await git(this.runner, this.cwd, "status", "--short")) {
-        const candidateParentOid = oid(
-          await git(this.runner, this.cwd, "rev-parse", "HEAD"),
-        );
+      const candidateParentOid = oid(
+        await git(this.runner, this.cwd, "rev-parse", "HEAD"),
+      );
+      await git(
+        this.runner,
+        this.cwd,
+        "commit",
+        "--allow-empty",
+        "--message",
+        "Build candidate Card",
+        "--message",
+        candidateCommitTrailers(candidate, candidateParentOid),
+      );
+      try {
         await git(
           this.runner,
           this.cwd,
-          "commit",
-          "--message",
-          "Build candidate Card",
-          "--message",
-          candidateCommitTrailers(candidate, candidateParentOid),
+          "push",
+          "--force-with-lease",
+          this.remote,
+          `${this.branch}:${this.branch}`,
         );
-        try {
-          await git(
+      } catch {
+        const readback = await this.readWorkspace().catch(() => undefined);
+        if (
+          readback?.value &&
+          (await candidateMatches(
             this.runner,
             this.cwd,
-            "push",
-            "--force-with-lease",
-            this.remote,
-            `${this.branch}:${this.branch}`,
-          );
-        } catch {
-          const readback = await this.readWorkspace().catch(() => undefined);
-          if (
-            readback?.value &&
-            (await candidateMatches(
-              this.runner,
-              this.cwd,
-              readback.value,
-              candidate,
-            ))
-          )
-            return { kind: "alreadyApplied", value: readback.value };
-          return { kind: "retryableTransport" };
-        }
+            readback.value,
+            candidate,
+          ))
+        )
+          return { kind: "alreadyApplied", value: readback.value };
+        return { kind: "retryableTransport" };
       }
       const head = oid(await git(this.runner, this.cwd, "rev-parse", "HEAD"));
       const cardBlob = oid(
@@ -638,8 +668,13 @@ export class RealGitWorkspace {
         retainedCommitOids,
       };
       return { kind: "succeeded", value: readback };
-    } catch {
-      return { kind: "unknownOutcome" };
+    } catch (error) {
+      return {
+        kind: "unknownOutcome",
+        ...(error instanceof GitCommandError
+          ? { detail: gitCommandFailureDetail(error) }
+          : {}),
+      };
     }
   }
 
@@ -841,6 +876,11 @@ export class RealGitWorkspace {
       sourceHeadOid,
     };
   }
+}
+
+function gitCommandFailureDetail(error: GitCommandError): string {
+  const operation = error.result.argv[0] ?? "unknown";
+  return `operation=${operation}; status=${error.result.status}; category=local-git`;
 }
 
 function oidFromBytes(bytes: Uint8Array): Oid {

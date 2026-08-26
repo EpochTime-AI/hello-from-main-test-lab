@@ -1,9 +1,10 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import {
   createGitRunner,
   GitCommandError,
   type GitRunner,
+  installGitAuthentication,
   RealGitWorkspace,
 } from "../../src/adapters/git.js";
 import {
@@ -587,6 +588,238 @@ describe("real local Git scenario", () => {
           ).readWorkspace()
         ).value?.candidate,
       ).toBeUndefined();
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("refreshes a legacy candidate with unchanged rendered files without contaminating its checkout", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const auth = await installGitAuthentication({
+        root: scenario.integrationPath,
+        token: "sanitized-test-token",
+      });
+      try {
+        const runner = createGitRunner({ root: scenario.root, env: auth.env });
+        const workspace = new RealGitWorkspace(
+          runner,
+          scenario.integrationPath,
+          "origin",
+          "feature/card-alice-source-1",
+        );
+        const integrationHead = oid(
+          (
+            await runner.run(
+              ["rev-parse", "origin/feature/card-alice-source-1"],
+              { cwd: scenario.integrationPath },
+            )
+          ).stdout.trim(),
+        );
+        const cardBytes = new TextEncoder().encode(
+          (
+            await runner.run(["show", `${integrationHead}:people/alice.md`], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout,
+        );
+        const readmeBytes = new TextEncoder().encode(
+          (
+            await runner.run(["show", `${integrationHead}:README.md`], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout,
+        );
+        const write = (
+          mainOid: ReturnType<typeof oid>,
+          head: ReturnType<typeof oid>,
+        ) => ({
+          input: {
+            observedMainOid: mainOid,
+            expectedIntegrationHeadOid: head,
+            cardPath: "people/alice.md",
+            cardBytes,
+            readmeBytes,
+          },
+          postconditions: {
+            cardManifest: {
+              path: "people/alice.md",
+              blobOid: gitBlobOid(cardBytes),
+              githubId: "7",
+              sourcePrNumber: 1,
+            },
+            readmeBlobOid: gitBlobOid(readmeBytes),
+            history: {
+              retainCommitOids: [integrationHead],
+              requiredParentOids: [integrationHead],
+            },
+          },
+        });
+        const advanceMain = async (message: string, contents: string) => {
+          await runner.run(["switch", "main"], {
+            cwd: scenario.integrationPath,
+          });
+          await writeFile(
+            `${scenario.integrationPath}/source-only.txt`,
+            contents,
+          );
+          await runner.run(["add", "--", "source-only.txt"], {
+            cwd: scenario.integrationPath,
+          });
+          await runner.run(["commit", "--message", message], {
+            cwd: scenario.integrationPath,
+          });
+          await runner.run(["push", "origin", "HEAD:main"], {
+            cwd: scenario.integrationPath,
+          });
+          return oid(
+            (
+              await runner.run(["rev-parse", "origin/main"], {
+                cwd: scenario.integrationPath,
+              })
+            ).stdout.trim(),
+          );
+        };
+
+        const firstMain = await advanceMain("Advance main source", "one\n");
+        const initial = await workspace.writeIntegrationCandidate(
+          write(firstMain, integrationHead),
+        );
+        expect(initial.kind).toBe("succeeded");
+        if (initial.kind !== "succeeded")
+          throw new Error("candidate is required");
+        const legacyCandidate = initial.value.integrationHeadOid;
+        if (!legacyCandidate) throw new Error("candidate head is required");
+        const firstRefresh = oid(
+          (
+            await runner.run(["rev-parse", "HEAD^"], {
+              cwd: scenario.integrationPath,
+            })
+          ).stdout.trim(),
+        );
+        const legacyMessage = (
+          await runner.run(["show", "-s", "--format=%B", legacyCandidate], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.replace(
+          `Hello-From-Main-Required-Parent-Oids: ${firstRefresh}`,
+          `Hello-From-Main-Required-Parent-Oids: ${integrationHead}`,
+        );
+        await runner.run(
+          [
+            "commit",
+            "--amend",
+            "--allow-empty",
+            "--no-edit",
+            "--message",
+            legacyMessage,
+          ],
+          { cwd: scenario.integrationPath },
+        );
+        await runner.run(
+          [
+            "push",
+            "--force-with-lease",
+            "origin",
+            "HEAD:feature/card-alice-source-1",
+          ],
+          { cwd: scenario.integrationPath },
+        );
+        const legacyHead = oid(
+          (
+            await runner.run(
+              ["rev-parse", "origin/feature/card-alice-source-1"],
+              { cwd: scenario.integrationPath },
+            )
+          ).stdout.trim(),
+        );
+        const currentMain = await advanceMain(
+          "Advance main source again",
+          "two\n",
+        );
+
+        const refreshed = await workspace.writeIntegrationCandidate(
+          write(currentMain, legacyHead),
+        );
+        expect(refreshed.kind).toBe("succeeded");
+        if (refreshed.kind !== "succeeded")
+          throw new Error("candidate is required");
+        const candidateHead = refreshed.value.integrationHeadOid;
+        if (!candidateHead) throw new Error("candidate head is required");
+        const candidateParents = (
+          await runner.run(
+            ["rev-list", "--parents", "-n", "1", candidateHead],
+            {
+              cwd: scenario.integrationPath,
+            },
+          )
+        ).stdout
+          .trim()
+          .split(" ")
+          .slice(1)
+          .map(oid);
+        expect(candidateParents).toHaveLength(1);
+        const [refreshCommit] = candidateParents;
+        if (!refreshCommit) throw new Error("refresh commit is required");
+        const refreshParents = (
+          await runner.run(
+            ["rev-list", "--parents", "-n", "1", refreshCommit],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout
+          .trim()
+          .split(" ")
+          .slice(1)
+          .map(oid);
+        expect(refreshParents).toEqual([legacyHead, currentMain]);
+        expect(
+          (
+            await runner.run(
+              [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                refreshCommit,
+                candidateHead,
+              ],
+              {
+                cwd: scenario.integrationPath,
+              },
+            )
+          ).stdout,
+        ).toBe("");
+        expect(
+          await runner.run(["status", "--porcelain"], {
+            cwd: scenario.integrationPath,
+          }),
+        ).toMatchObject({ stdout: "" });
+        await expect(
+          access(`${scenario.integrationPath}/git-askpass.sh`),
+        ).rejects.toBeDefined();
+        expect(refreshed.value.candidate?.mainOid).toBe(currentMain);
+        expect(
+          (
+            await new RealGitWorkspace(
+              runner,
+              scenario.integrationPath,
+              "origin",
+              "feature/card-alice-source-1",
+            ).readWorkspace()
+          ).value?.candidate?.integrationHeadOid,
+        ).toBe(candidateHead);
+        const repeated = await workspace.writeIntegrationCandidate(
+          write(currentMain, candidateHead),
+        );
+        expect(repeated).toMatchObject({
+          kind: "alreadyApplied",
+          value: { integrationHeadOid: candidateHead },
+        });
+      } finally {
+        await auth.dispose();
+      }
     } finally {
       await scenario.dispose();
     }

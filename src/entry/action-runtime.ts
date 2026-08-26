@@ -101,54 +101,54 @@ async function runProductionComposition(input: {
     root: workspace,
     token,
   });
-  const sourceContext: InvocationContext = {
-    signal: new AbortController().signal,
-    expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
-    expectedSourceLogin: runtime.sourceLogin,
-  };
-  let repositoryId: number;
   try {
-    repositoryId = await trustedRepositoryId(transport, owner, repo);
-  } catch {
-    process.stdout.write(
-      `${JSON.stringify({
-        kind: "hello-from-main-diagnostic",
-        stage: "pre-composition",
-        outcome: "terminal",
-        reason: "capabilityUnavailable",
-      })}\n`,
-    );
-    throw new Error("trusted repository identity is unavailable");
-  }
-  const composition = createActionComposition({
-    context,
-    github: bindProductionSetup(
-      createOctokitGithubPlatform({
-        owner,
-        repo,
-        transport,
-        ...(runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {}),
-        repositoryId,
-        expectedCommentOwner: runtime.commentOwner,
-      }),
-      runtime,
-      new RealGitWorkspace(
+    const sourceContext: InvocationContext = {
+      signal: new AbortController().signal,
+      expectedSourcePullRequestNumber: runtime.sourcePullRequestNumber,
+      expectedSourceLogin: runtime.sourceLogin,
+    };
+    let repositoryId: number;
+    try {
+      repositoryId = await trustedRepositoryId(transport, owner, repo);
+    } catch {
+      process.stdout.write(
+        `${JSON.stringify({
+          kind: "hello-from-main-diagnostic",
+          stage: "pre-composition",
+          outcome: "terminal",
+          reason: "capabilityUnavailable",
+        })}\n`,
+      );
+      throw new Error("trusted repository identity is unavailable");
+    }
+    const composition = createActionComposition({
+      context,
+      github: bindProductionSetup(
+        createOctokitGithubPlatform({
+          owner,
+          repo,
+          transport,
+          ...(runtime.apiOrigin ? { apiOrigin: runtime.apiOrigin } : {}),
+          repositoryId,
+          expectedCommentOwner: runtime.commentOwner,
+        }),
+        runtime,
+        new RealGitWorkspace(
+          createGitRunner({ root: workspace, env: gitAuth.env }),
+          workspace,
+          runtime.remote,
+          runtime.branch,
+        ),
+      ),
+      git: new RealGitWorkspace(
         createGitRunner({ root: workspace, env: gitAuth.env }),
         workspace,
         runtime.remote,
         runtime.branch,
       ),
-    ),
-    git: new RealGitWorkspace(
-      createGitRunner({ root: workspace, env: gitAuth.env }),
-      workspace,
-      runtime.remote,
-      runtime.branch,
-    ),
-    candidatePolicy: productionCandidatePolicy,
-    invocationContext: sourceContext,
-  });
-  try {
+      candidatePolicy: productionCandidatePolicy,
+      invocationContext: sourceContext,
+    });
     const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
       process.stdout.write(
         `${JSON.stringify({
