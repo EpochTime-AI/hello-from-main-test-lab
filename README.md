@@ -43,5 +43,13 @@
 ## 来自 main 的留言
 
 <!-- cards:start -->
-<!-- generated from people/*.md; do not edit manually -->
+[![c-w-xiaohei](https://avatars.githubusercontent.com/u/88074703?v=4)](https://github.com/c-w-xiaohei)
+
+[c-w-xiaohei](https://github.com/c-w-xiaohei) · **Carson**
+
+最近在折腾：把 GitHub 自动化流程跑通
+
+> 让每一步都可验证，也让每次协作都留下清晰的记录
+
+[查看完整 Card](people/c-w-xiaohei.md)
 <!-- cards:end -->
