@@ -250,6 +250,8 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
   } catch {
     return void 0;
   }
+  if (!mainOid) return void 0;
+  const observedMainOid = mainOid;
   const cardBlobOid = oid(
     await git(
       runner,
@@ -258,11 +260,26 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
       `${head}:${trailers.cardManifest.path}`
     )
   );
-  if (cardBlobOid !== trailers.cardManifest.blobOid || readmeBlobOid !== trailers.readmeBlobOid || !trailers.history.retainCommitOids.every(
+  const canonicalParentContract = trailers.history.requiredParentOids.length === 1 && requiredParentOids.length === 1 && trailers.history.requiredParentOids[0] === requiredParentOids[0];
+  const legacyH2ParentContract = !canonicalParentContract && await legacyH2CandidateParentContract(
+    runner,
+    cwd,
+    trailers.history.requiredParentOids,
+    trailers.history.retainCommitOids,
+    requiredParentOids,
+    retainedCommitOids,
+    observedMainOid
+  );
+  const treeDeltaIsExact = await candidateTreeDeltaIsExact(
+    runner,
+    cwd,
+    head,
+    requiredParentOids,
+    trailers.cardManifest.path
+  );
+  if (cardBlobOid !== trailers.cardManifest.blobOid || readmeBlobOid !== trailers.readmeBlobOid || trailers.mainOid !== observedMainOid || !trailers.history.retainCommitOids.every(
     (commit) => retainedCommitOids.includes(commit)
-  ) || !trailers.history.requiredParentOids.every(
-    (parent) => requiredParentOids.includes(parent)
-  ))
+  ) || !treeDeltaIsExact || !canonicalParentContract && !legacyH2ParentContract)
     return void 0;
   const readmeBytes = new TextEncoder().encode(
     (await runner.run(["show", `${head}:README.md`], { cwd })).stdout
@@ -271,7 +288,7 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
     observedOid: head,
     provenance: "observed",
     integrationHeadOid: head,
-    mainOid: trailers.mainOid ?? mainOid,
+    mainOid: trailers.mainOid,
     cardPath: trailers.cardManifest.path,
     cardBlobOid,
     readmeBlobOid,
@@ -279,6 +296,34 @@ async function candidateFromCommit(runner, cwd, head, readmeBlobOid, retainedCom
     retainedCommitOids,
     requiredParentOids
   };
+}
+async function candidateTreeDeltaIsExact(runner, cwd, head, candidateParents, cardPath) {
+  const [parent] = candidateParents;
+  if (candidateParents.length !== 1 || !parent) return false;
+  const changedPaths = (await git(
+    runner,
+    cwd,
+    "diff-tree",
+    "--no-commit-id",
+    "--name-only",
+    "-r",
+    parent,
+    head
+  )).split("\n").filter(Boolean);
+  return changedPaths.every(
+    (path) => path === cardPath || path === "README.md"
+  );
+}
+async function legacyH2CandidateParentContract(runner, cwd, trailerRequiredParentOids, trailerRetainCommitOids, candidateParents, retainedCommitOids, mainOid) {
+  const [trailerRequiredParentOid] = trailerRequiredParentOids;
+  const [preRefreshIntegrationOid] = trailerRetainCommitOids;
+  const [candidateParent] = candidateParents;
+  if (trailerRequiredParentOids.length !== 1 || candidateParents.length !== 1 || !trailerRequiredParentOid || !preRefreshIntegrationOid || !candidateParent || trailerRequiredParentOid === mainOid || trailerRequiredParentOid !== preRefreshIntegrationOid || !trailerRequiredParentOids.every(
+    (parent) => retainedCommitOids.includes(parent)
+  ))
+    return false;
+  const refreshParents = (await git(runner, cwd, "rev-list", "--parents", "-n", "1", candidateParent)).split(" ").slice(1).filter(Boolean).map(oid);
+  return refreshParents.length === 2 && refreshParents[0] === preRefreshIntegrationOid && refreshParents[1] === mainOid;
 }
 function candidateCommitTrailers(candidate, parent) {
   const { cardManifest, readmeBlobOid, history } = candidate.postconditions;
@@ -323,13 +368,28 @@ function parseCandidateTrailers(commit) {
     }
   };
 }
-function candidateMatches(readback, candidate) {
+async function candidateMatches(runner, cwd, readback, candidate) {
   const actual = readback.candidate;
-  return actual?.cardPath === candidate.postconditions.cardManifest.path && actual.cardBlobOid === candidate.postconditions.cardManifest.blobOid && actual.readmeBlobOid === candidate.postconditions.readmeBlobOid && candidate.postconditions.history.retainCommitOids.every(
-    (commit) => readback.retainedCommitOids?.includes(commit)
-  ) && candidate.postconditions.history.requiredParentOids.every(
-    (parent) => actual.requiredParentOids?.includes(parent)
+  const head = readback.integrationHeadOid;
+  const readmeBlobOid = readback.readmeBlobOid;
+  const retainedCommitOids = readback.retainedCommitOids;
+  const requiredParentOids = readback.requiredParentOids;
+  if (!actual || !head || !readmeBlobOid || !retainedCommitOids || !requiredParentOids)
+    return false;
+  const validated = await candidateFromCommit(
+    runner,
+    cwd,
+    head,
+    readmeBlobOid,
+    retainedCommitOids,
+    requiredParentOids,
+    candidate.input.observedMainOid
   );
+  return validated?.mainOid === candidate.input.observedMainOid && validated.cardPath === candidate.postconditions.cardManifest.path && validated.cardBlobOid === candidate.postconditions.cardManifest.blobOid && validated.readmeBlobOid === candidate.postconditions.readmeBlobOid && candidate.postconditions.history.retainCommitOids.every(
+    (commit) => retainedCommitOids.includes(commit)
+  ) && validated.requiredParentOids?.length === 1 && (candidate.postconditions.history.requiredParentOids.length === 0 || candidate.postconditions.history.requiredParentOids.every(
+    (parent) => retainedCommitOids.includes(parent)
+  ));
 }
 async function isAncestor(runner, cwd, ancestor, descendant) {
   try {
@@ -383,6 +443,7 @@ var init_git = __esm({
       "update-ref",
       "cat-file",
       "diff",
+      "diff-tree",
       "rev-list"
     ]);
     legacyCandidateManifestPath = ".hello-from-main/candidate.json";
@@ -636,6 +697,9 @@ var init_git = __esm({
             "README.md"
           );
           if (await git(this.runner, this.cwd, "status", "--short")) {
+            const candidateParentOid = oid(
+              await git(this.runner, this.cwd, "rev-parse", "HEAD")
+            );
             await git(
               this.runner,
               this.cwd,
@@ -643,7 +707,7 @@ var init_git = __esm({
               "--message",
               "Build candidate Card",
               "--message",
-              candidateCommitTrailers(candidate, current)
+              candidateCommitTrailers(candidate, candidateParentOid)
             );
             try {
               await git(
@@ -656,7 +720,12 @@ var init_git = __esm({
               );
             } catch {
               const readback2 = await this.readWorkspace().catch(() => void 0);
-              if (readback2?.value && candidateMatches(readback2.value, candidate))
+              if (readback2?.value && await candidateMatches(
+                this.runner,
+                this.cwd,
+                readback2.value,
+                candidate
+              ))
                 return { kind: "alreadyApplied", value: readback2.value };
               return { kind: "retryableTransport" };
             }
@@ -699,12 +768,24 @@ var init_git = __esm({
             "1",
             "HEAD"
           )).split(" ").slice(1).map(oid);
-          if (!candidate.postconditions.history.requiredParentOids.every(
-            (parent) => requiredParentOids.includes(parent)
-          ))
+          if (requiredParentOids.length !== 1)
             return {
               kind: "policyPostcondition",
-              detail: "immediate parent mismatch"
+              detail: "candidate must have one immediate parent"
+            };
+          const parsedCandidate = await candidateFromCommit(
+            this.runner,
+            this.cwd,
+            head,
+            readmeBlob,
+            retainedCommitOids,
+            requiredParentOids,
+            candidate.input.observedMainOid
+          );
+          if (!parsedCandidate)
+            return {
+              kind: "policyPostcondition",
+              detail: "candidate tree or parent contract mismatch"
             };
           const readback = {
             status: "ready",
