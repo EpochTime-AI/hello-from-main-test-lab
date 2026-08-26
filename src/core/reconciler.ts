@@ -740,6 +740,7 @@ async function terminalPublicationOutcome(
     !main.readmeBytes ||
     !source.mergeCommitOid ||
     !integration.mergeCommitOid ||
+    !integration.mergeParentOids ||
     !facts.protocolAnchors?.contribution ||
     !facts.protocolAnchors.integration
   )
@@ -787,6 +788,8 @@ async function terminalPublicationOutcome(
   );
   if (actual.status !== "ready" || !actual.value)
     return observationOutcome(actual.status);
+  if (actual.value.mainOid !== expected.mainOid)
+    return { kind: "retryable", reason: "stalePrecondition" };
   if (!validateFinalMain(actual.value, expected))
     return { kind: "terminal", reason: "policyRejected" };
   if (!commentsSupported) return { kind: "quiescent" };
@@ -947,19 +950,9 @@ async function executeEffect(
     dependencies.github.mergePullRequest(effect.request, context),
   );
   if (merge.kind === "integrationRejected") return mergeOutcome(merge);
-  const expected = {
-    ...effect.expectedFinalMain,
-    mainOid: merge.mainOid,
-    integrationMergeCommitOid: merge.mainOid,
-  };
-  const actual = await withinBudget(budget, (context) =>
-    dependencies.git.readFinalMainPostconditions(expected, context),
-  );
-  if (actual.status !== "ready" || !actual.value)
-    return observationOutcome(actual.status);
-  if (!validateFinalMain(actual.value, expected))
-    return { kind: "retryable", reason: "stalePrecondition" };
-  return effect.commentsSupported ? undefined : { kind: "quiescent" };
+  // Git establishes publication; a fresh provider observation establishes the
+  // requested PR's merged lifecycle before completion can be emitted.
+  return { kind: "awaitingExternalFact", reason: "pending" };
 }
 
 function isReconcileOutcome(

@@ -9,7 +9,14 @@ import {
   createOctokitGithubPlatform,
   type OctokitRequestTransport,
 } from "../adapters/octokit.js";
-import type { RepositoryFacts, TrustedPrincipal } from "../core/model.js";
+import type {
+  ContributionMergeRequest,
+  ContributionMergeResult,
+  IntegrationMergeRequest,
+  IntegrationMergeResult,
+  RepositoryFacts,
+  TrustedPrincipal,
+} from "../core/model.js";
 import type {
   GithubPlatform,
   InvocationContext,
@@ -310,13 +317,30 @@ function trustedApiMatchesServer(
   );
 }
 
-function bindProductionSetup(
+export function bindProductionSetup(
   github: GithubPlatform,
   runtime: IntegrationRuntimeConfig,
   workspace: RealGitWorkspace,
 ): GithubPlatform {
+  function mergePullRequest(
+    request: ContributionMergeRequest,
+    context?: InvocationContext,
+  ): Promise<ContributionMergeResult>;
+  function mergePullRequest(
+    request: IntegrationMergeRequest,
+    context?: InvocationContext,
+  ): Promise<IntegrationMergeResult>;
+  async function mergePullRequest(
+    request: ContributionMergeRequest | IntegrationMergeRequest,
+    context?: InvocationContext,
+  ): Promise<ContributionMergeResult | IntegrationMergeResult> {
+    if (request.kind === "integration")
+      return workspace.publishIntegrationMerge(request, context);
+    return github.mergePullRequest(request, context);
+  }
   return {
     ...github,
+    mergePullRequest,
     async createIntegrationBranch(input, _context) {
       // The RealGitWorkspace is authoritative for the shell commit. The provider
       // ref call remains the durable anchor/readback path and is idempotent when

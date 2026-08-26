@@ -259,6 +259,78 @@ function gitCommandFailureDetail(error) {
   const operation = error.result.argv[0] ?? "unknown";
   return `operation=${operation}; status=${error.result.status}; category=local-git`;
 }
+async function readIntegrationPublication(runner, cwd, remote, branch, mergeOid, request, expectedTreeOid) {
+  try {
+    await git(
+      runner,
+      cwd,
+      "fetch",
+      remote,
+      "refs/heads/main:refs/remotes/origin/main",
+      `+refs/heads/${branch}:refs/remotes/origin/${branch}`
+    );
+    const remoteMain = oid(await git(runner, cwd, "rev-parse", "origin/main"));
+    const remoteCandidate = oid(
+      await git(runner, cwd, "rev-parse", `origin/${branch}`)
+    );
+    if (remoteMain === mergeOid)
+      return await integrationMergeMatches(
+        runner,
+        cwd,
+        mergeOid,
+        request,
+        expectedTreeOid
+      ) ? { kind: "applied", oid: mergeOid } : { kind: "inconclusive" };
+    const existing = await findPublishedIntegrationMerge(
+      runner,
+      cwd,
+      remoteMain,
+      request,
+      expectedTreeOid
+    );
+    if (existing.kind === "exact")
+      return { kind: "applied", oid: existing.oid };
+    if (existing.kind === "ambiguous") return { kind: "inconclusive" };
+    if (remoteMain === request.observedBaseOid && remoteCandidate !== request.expectedHeadOid)
+      return { kind: "staleCandidate" };
+    return remoteMain === request.observedBaseOid ? { kind: "inconclusive" } : { kind: "baseMoved" };
+  } catch {
+    return { kind: "inconclusive" };
+  }
+}
+function integrationReadbackRejectionReason(readback) {
+  if (readback.kind === "baseMoved") return "baseMoved";
+  if (readback.kind === "staleCandidate") return "stalePrecondition";
+  return "unknownOutcome";
+}
+async function findPublishedIntegrationMerge(runner, cwd, mainOid, request, expectedTreeOid) {
+  const commits = (await git(runner, cwd, "rev-list", "--max-count=256", mainOid)).split("\n").filter(Boolean).map(oid);
+  const matches = [];
+  for (const commit of commits) {
+    if (await integrationMergeMatches(
+      runner,
+      cwd,
+      commit,
+      request,
+      expectedTreeOid
+    ))
+      matches.push(commit);
+  }
+  if (matches.length === 0) return { kind: "none" };
+  if (matches.length === 1 && matches[0])
+    return { kind: "exact", oid: matches[0] };
+  return { kind: "ambiguous" };
+}
+async function integrationMergeMatches(runner, cwd, mergeOid, request, expectedTree) {
+  const parents = (await git(runner, cwd, "rev-list", "--parents", "-n", "1", mergeOid)).split(" ").slice(1).filter(Boolean).map(oid);
+  const tree = oid(await git(runner, cwd, "rev-parse", `${mergeOid}^{tree}`));
+  return parents.length === 2 && parents[0] === request.observedBaseOid && parents[1] === request.expectedHeadOid && tree === expectedTree;
+}
+function isPolicyRejection(error) {
+  return /protected branch|hook declined|GH006|denied|permission/i.test(
+    error.result.stderr
+  );
+}
 function oidFromBytes(bytes) {
   const header = Buffer.from(`blob ${bytes.byteLength}\0`);
   return oid(createHash2("sha1").update(header).update(bytes).digest("hex"));
@@ -955,6 +1027,128 @@ var init_git = __esm({
           `${this.branch}:${this.branch}`
         );
         return { mergeCommitOid, parents };
+      }
+      async publishIntegrationMerge(request, context) {
+        this.activeSignal = context?.signal;
+        if (request.baseCurrentGate !== "required")
+          return { kind: "integrationRejected", reason: "gateUnsupported" };
+        try {
+          await git(
+            this.runner,
+            this.cwd,
+            "fetch",
+            this.remote,
+            "refs/heads/main:refs/remotes/origin/main",
+            `+refs/heads/${this.branch}:refs/remotes/origin/${this.branch}`
+          );
+          const observedMain = oid(
+            await git(this.runner, this.cwd, "rev-parse", "origin/main")
+          );
+          const expectedTreeOid = oid(
+            await git(
+              this.runner,
+              this.cwd,
+              "rev-parse",
+              `${request.expectedHeadOid}^{tree}`
+            )
+          );
+          const existing = await findPublishedIntegrationMerge(
+            this.runner,
+            this.cwd,
+            observedMain,
+            request,
+            expectedTreeOid
+          );
+          if (existing.kind === "exact")
+            return { kind: "integrationAlreadyApplied", mainOid: existing.oid };
+          if (existing.kind === "ambiguous")
+            return { kind: "integrationRejected", reason: "unknownOutcome" };
+          if (observedMain !== request.observedBaseOid)
+            return { kind: "integrationRejected", reason: "baseMoved" };
+          const observedCandidateOid = oid(
+            await git(this.runner, this.cwd, "rev-parse", `origin/${this.branch}`)
+          );
+          if (observedCandidateOid !== request.expectedHeadOid)
+            return { kind: "integrationRejected", reason: "stalePrecondition" };
+          await git(this.runner, this.cwd, "switch", "-C", "main", observedMain);
+          try {
+            await git(
+              this.runner,
+              this.cwd,
+              "merge",
+              "--no-ff",
+              "--no-edit",
+              observedCandidateOid
+            );
+          } catch (error) {
+            await git(this.runner, this.cwd, "merge", "--abort").catch(
+              () => void 0
+            );
+            throw error;
+          }
+          const proposedMergeOid = oid(
+            await git(this.runner, this.cwd, "rev-parse", "HEAD")
+          );
+          if (!await integrationMergeMatches(
+            this.runner,
+            this.cwd,
+            proposedMergeOid,
+            request,
+            expectedTreeOid
+          ))
+            return { kind: "integrationRejected", reason: "gateRejected" };
+          try {
+            await git(
+              this.runner,
+              this.cwd,
+              "push",
+              "--porcelain",
+              "--atomic",
+              `--force-with-lease=refs/heads/main:${request.observedBaseOid}`,
+              `--force-with-lease=refs/heads/${this.branch}:${request.expectedHeadOid}`,
+              this.remote,
+              `${proposedMergeOid}:refs/heads/main`,
+              `${request.expectedHeadOid}:refs/heads/${this.branch}`
+            );
+          } catch (error) {
+            const readback2 = await readIntegrationPublication(
+              this.runner,
+              this.cwd,
+              this.remote,
+              this.branch,
+              proposedMergeOid,
+              request,
+              expectedTreeOid
+            );
+            if (readback2.kind === "applied")
+              return { kind: "integrationAlreadyApplied", mainOid: readback2.oid };
+            const readbackReason = integrationReadbackRejectionReason(readback2);
+            return {
+              kind: "integrationRejected",
+              reason: readbackReason === "unknownOutcome" && error instanceof GitCommandError && isPolicyRejection(error) ? "policyRejected" : readbackReason
+            };
+          }
+          const readback = await readIntegrationPublication(
+            this.runner,
+            this.cwd,
+            this.remote,
+            this.branch,
+            proposedMergeOid,
+            request,
+            expectedTreeOid
+          );
+          if (readback.kind === "applied")
+            return { kind: "integrationMerged", mainOid: readback.oid };
+          return {
+            kind: "integrationRejected",
+            reason: integrationReadbackRejectionReason(readback)
+          };
+        } catch (error) {
+          return {
+            kind: "integrationRejected",
+            reason: error instanceof GitCommandError && isPolicyRejection(error) ? "policyRejected" : "retryableTransport"
+          };
+        }
       }
       async isAncestor(ancestor, descendant, expectedSourceOid) {
         const remote = descendant.split("/", 1)[0];
@@ -3538,7 +3732,7 @@ async function terminalPublicationOutcome(facts, git2, budget, commentsSupported
   if (!integration?.closed) return void 0;
   if (!integration.merged)
     return { kind: "terminal", reason: "policyRejected" };
-  if (!main || !source?.authorLogin || !source.authorGithubId || !main.readmeBytes || !source.mergeCommitOid || !integration.mergeCommitOid || !facts.protocolAnchors?.contribution || !facts.protocolAnchors.integration)
+  if (!main || !source?.authorLogin || !source.authorGithubId || !main.readmeBytes || !source.mergeCommitOid || !integration.mergeCommitOid || !integration.mergeParentOids || !facts.protocolAnchors?.contribution || !facts.protocolAnchors.integration)
     return awaitingIncomplete();
   const contributionParents = [
     facts.protocolAnchors.contribution.projectShellOid,
@@ -3578,6 +3772,8 @@ async function terminalPublicationOutcome(facts, git2, budget, commentsSupported
   );
   if (actual.status !== "ready" || !actual.value)
     return observationOutcome(actual.status);
+  if (actual.value.mainOid !== expected.mainOid)
+    return { kind: "retryable", reason: "stalePrecondition" };
   if (!validateFinalMain(actual.value, expected))
     return { kind: "terminal", reason: "policyRejected" };
   if (!commentsSupported) return { kind: "quiescent" };
@@ -3640,10 +3836,10 @@ async function executeEffect(effect, dependencies, budget) {
       return candidateWriteOutcome(result);
     if (effect.candidate.input.preserveConfirmedCardBlobOid !== void 0 && result.value.candidate?.cardBlobOid !== effect.candidate.input.preserveConfirmedCardBlobOid)
       return { kind: "retryable", reason: "stalePrecondition" };
-    const actual2 = result.value.candidate;
+    const actual = result.value.candidate;
     const readback = result.value;
-    const expected2 = effect.candidate.postconditions;
-    if (!actual2 || actual2.cardPath !== expected2.cardManifest.path || actual2.cardBlobOid !== expected2.cardManifest.blobOid || actual2.readmeBlobOid !== expected2.readmeBlobOid || !expected2.history.retainCommitOids.every(
+    const expected = effect.candidate.postconditions;
+    if (!actual || actual.cardPath !== expected.cardManifest.path || actual.cardBlobOid !== expected.cardManifest.blobOid || actual.readmeBlobOid !== expected.readmeBlobOid || !expected.history.retainCommitOids.every(
       (commit) => readback.retainedCommitOids?.includes(commit) === true
     ))
       return { kind: "retryable", reason: "stalePrecondition" };
@@ -3709,20 +3905,7 @@ async function executeEffect(effect, dependencies, budget) {
     (context) => dependencies.github.mergePullRequest(effect.request, context)
   );
   if (merge.kind === "integrationRejected") return mergeOutcome(merge);
-  const expected = {
-    ...effect.expectedFinalMain,
-    mainOid: merge.mainOid,
-    integrationMergeCommitOid: merge.mainOid
-  };
-  const actual = await withinBudget(
-    budget,
-    (context) => dependencies.git.readFinalMainPostconditions(expected, context)
-  );
-  if (actual.status !== "ready" || !actual.value)
-    return observationOutcome(actual.status);
-  if (!validateFinalMain(actual.value, expected))
-    return { kind: "retryable", reason: "stalePrecondition" };
-  return effect.commentsSupported ? void 0 : { kind: "quiescent" };
+  return { kind: "awaitingExternalFact", reason: "pending" };
 }
 function isReconcileOutcome(value) {
   return value.kind === "quiescent" || value.kind === "awaitingExternalFact" || value.kind === "retryable" || value.kind === "budgetExhausted" || value.kind === "terminal";
@@ -4283,8 +4466,14 @@ function trustedApiMatchesServer(apiOrigin, serverOrigin) {
   return apiOrigin === "https://api.github.com" && serverOrigin === "https://github.com" || new URL(apiOrigin).origin === serverOrigin;
 }
 function bindProductionSetup(github, runtime, workspace) {
+  async function mergePullRequest(request, context) {
+    if (request.kind === "integration")
+      return workspace.publishIntegrationMerge(request, context);
+    return github.mergePullRequest(request, context);
+  }
   return {
     ...github,
+    mergePullRequest,
     async createIntegrationBranch(input, _context) {
       if (!input.cardPath || !input.cardBytes)
         return {
@@ -4436,6 +4625,7 @@ function required2(value, name) {
 }
 if (process.env.NODE_ENV !== "test") void runTrustedAction();
 export {
+  bindProductionSetup,
   createGithubTransport,
   deriveIntegrationRuntimeConfig,
   gitFailureDetail,

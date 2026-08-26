@@ -2398,6 +2398,40 @@ describe("OctokitGithubPlatform", () => {
     },
   );
 
+  test("fails closed when an Integration merge has a first parent other than its observed base", async () => {
+    const platform = createLifecycleObservationPlatform({
+      sourceList: {
+        state: "closed",
+        merged: true,
+        merge_commit_sha: "source-merge",
+      },
+      sourceExact: {
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-26T00:00:00Z",
+        merge_commit_sha: "source-merge",
+      },
+      integrationList: {
+        state: "closed",
+        merged: true,
+        merge_commit_sha: "integration-merge",
+      },
+      integrationExact: {
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-26T00:00:00Z",
+        merge_commit_sha: "integration-merge",
+      },
+      integrationMergeCommit: {
+        parents: [{ sha: "wrong-base" }, { sha: "candidate" }],
+      },
+    });
+
+    await expect(platform.observeRepository()).resolves.toMatchObject({
+      status: "incomplete",
+    });
+  });
+
   test.each([
     "2026-02-29T11:00:21Z",
     "2026-02-30T11:00:21Z",
@@ -4151,6 +4185,7 @@ function createLifecycleObservationPlatform(input: {
   integrationList?: Record<string, unknown>;
   integrationExact?: Record<string, unknown>;
   mergeCommit?: Record<string, unknown>;
+  integrationMergeCommit?: Record<string, unknown>;
   onRequest?: (request: { method: string; path: string }) => void;
 }) {
   return createOctokitGithubPlatform({

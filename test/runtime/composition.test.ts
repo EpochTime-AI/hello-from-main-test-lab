@@ -2,7 +2,11 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { runTrustedAction } from "../../src/entry/action-runtime.js";
+import { oid } from "../../src/core/model.js";
+import {
+  bindProductionSetup,
+  runTrustedAction,
+} from "../../src/entry/action-runtime.js";
 import { createCliComposition } from "../../src/entry/cli.js";
 import type { GitWorkspace } from "../../src/ports/git-workspace.js";
 import type { GithubPlatform } from "../../src/ports/github-platform.js";
@@ -29,6 +33,73 @@ describe("runtime composition", () => {
         git: {} as GitWorkspace,
       }),
     ).toThrow("candidate policy is required");
+  });
+
+  test("routes production Integration publication through Git and preserves Octokit Contribution merges", async () => {
+    const contributionHead = oid("contribution-head");
+    const integrationHead = oid("integration-head");
+    const main = oid("main-base");
+    const octokit = {
+      mergePullRequest: vi.fn(async (request) =>
+        request.kind === "contribution"
+          ? { kind: "contributionMerged" as const, headOid: contributionHead }
+          : {
+              kind: "integrationRejected" as const,
+              reason: "gateUnsupported" as const,
+            },
+      ),
+    } as unknown as GithubPlatform;
+    const workspace = {
+      publishIntegrationMerge: vi.fn(async () => ({
+        kind: "integrationMerged" as const,
+        mainOid: oid("published-main"),
+      })),
+    } as unknown as import("../../src/adapters/git.js").RealGitWorkspace;
+    const platform = bindProductionSetup(
+      octokit,
+      {
+        remote: "origin",
+        branch: "feature/card-alice-source-1",
+        sourcePullRequestNumber: 1,
+        sourceLogin: "alice",
+        commentOwner: { actorId: "42", actorType: "Bot" },
+      },
+      workspace,
+    );
+
+    await expect(
+      platform.mergePullRequest({
+        kind: "contribution",
+        pullRequestNumber: 1,
+        expectedHeadOid: contributionHead,
+      }),
+    ).resolves.toEqual({
+      kind: "contributionMerged",
+      headOid: contributionHead,
+    });
+    await expect(
+      platform.mergePullRequest({
+        kind: "integration",
+        pullRequestNumber: 2,
+        expectedHeadOid: integrationHead,
+        observedBaseOid: main,
+        baseCurrentGate: "required",
+      }),
+    ).resolves.toEqual({
+      kind: "integrationMerged",
+      mainOid: oid("published-main"),
+    });
+    expect(octokit.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(workspace.publishIntegrationMerge).toHaveBeenCalledWith(
+      {
+        kind: "integration",
+        pullRequestNumber: 2,
+        expectedHeadOid: integrationHead,
+        observedBaseOid: main,
+        baseCurrentGate: "required",
+      },
+      undefined,
+    );
   });
 
   test("disposes authentication when repository identity setup fails", async () => {

@@ -274,6 +274,622 @@ describe("real local Git scenario", () => {
     }
   });
 
+  test("publishes an Integration merge with an explicit main lease and exact parents and tree", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const result = await scenario.botWorkspace.publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+
+      expect(result).toEqual({
+        kind: "integrationMerged",
+        mainOid: expect.any(String),
+      });
+      if (result.kind !== "integrationMerged")
+        throw new Error("Integration publication is required");
+      const remoteMain = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const parents = (
+        await runner.run(["rev-list", "--parents", "-n", "1", remoteMain], {
+          cwd: scenario.integrationPath,
+        })
+      ).stdout
+        .trim()
+        .split(" ")
+        .slice(1)
+        .map(oid);
+      expect(remoteMain).toBe(result.mainOid);
+      expect(parents).toEqual([observedBaseOid, expectedHeadOid]);
+      await expect(
+        runner.run(
+          [
+            "diff",
+            "--exit-code",
+            `${remoteMain}^{tree}`,
+            `${expectedHeadOid}^{tree}`,
+          ],
+          {
+            cwd: scenario.integrationPath,
+          },
+        ),
+      ).resolves.toBeDefined();
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("rejects a stale Integration main lease without moving main", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const writerPath = `${scenario.root}/stale-main-writer`;
+      await runner.run(["clone", scenario.upstream, writerPath], {
+        cwd: scenario.root,
+      });
+      let advanced = false;
+      const racingRunner: GitRunner = {
+        async run(argv, options) {
+          if (
+            !advanced &&
+            argv[0] === "push" &&
+            argv.some((arg) => arg.includes("refs/heads/main"))
+          ) {
+            advanced = true;
+            await runner.run(["switch", "main"], { cwd: writerPath });
+            await runner.run(
+              ["commit", "--allow-empty", "--message", "Advance main"],
+              {
+                cwd: writerPath,
+              },
+            );
+            await runner.run(["push", "origin", "HEAD:main"], {
+              cwd: writerPath,
+            });
+          }
+          return runner.run(argv, options);
+        },
+      };
+      const result = await new RealGitWorkspace(
+        racingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+
+      const remoteMain = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      expect(result).toEqual({
+        kind: "integrationRejected",
+        reason: "baseMoved",
+      });
+      expect(remoteMain).not.toBe(observedBaseOid);
+      expect(remoteMain).not.toBe(expectedHeadOid);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("atomically rejects a moved Integration candidate without moving main", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            {
+              cwd: scenario.integrationPath,
+            },
+          )
+        ).stdout.trim(),
+      );
+      const writerPath = `${scenario.root}/candidate-race-writer`;
+      await runner.run(["clone", scenario.upstream, writerPath], {
+        cwd: scenario.root,
+      });
+      let moved = false;
+      const racingRunner: GitRunner = {
+        async run(argv, options) {
+          if (!moved && argv[0] === "push" && argv.includes("--atomic")) {
+            moved = true;
+            await runner.run(["switch", "feature/card-alice-source-1"], {
+              cwd: writerPath,
+            });
+            await runner.run(
+              ["commit", "--allow-empty", "--message", "Move candidate"],
+              {
+                cwd: writerPath,
+              },
+            );
+            await runner.run(
+              ["push", "origin", "HEAD:feature/card-alice-source-1"],
+              {
+                cwd: writerPath,
+              },
+            );
+          }
+          return runner.run(argv, options);
+        },
+      };
+      const result = await new RealGitWorkspace(
+        racingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+      const remoteMain = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const remoteCandidate = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            {
+              cwd: scenario.integrationPath,
+            },
+          )
+        ).stdout.trim(),
+      );
+      expect(result).toEqual({
+        kind: "integrationRejected",
+        reason: "stalePrecondition",
+      });
+      expect(remoteMain).toBe(observedBaseOid);
+      expect(remoteCandidate).not.toBe(expectedHeadOid);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("atomically rejects a candidate moved backward without restoring it", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const writerPath = `${scenario.root}/candidate-backward-writer`;
+      await runner.run(["clone", scenario.upstream, writerPath], {
+        cwd: scenario.root,
+      });
+      let moved = false;
+      const racingRunner: GitRunner = {
+        async run(argv, options) {
+          if (!moved && argv[0] === "push" && argv.includes("--atomic")) {
+            moved = true;
+            await runner.run(
+              [
+                "push",
+                `--force-with-lease=refs/heads/feature/card-alice-source-1:${expectedHeadOid}`,
+                "origin",
+                `${observedBaseOid}:refs/heads/feature/card-alice-source-1`,
+              ],
+              { cwd: writerPath },
+            );
+          }
+          return runner.run(argv, options);
+        },
+      };
+      const result = await new RealGitWorkspace(
+        racingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+      const remoteMain = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const remoteCandidate = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      expect(result).toEqual({
+        kind: "integrationRejected",
+        reason: "stalePrecondition",
+      });
+      expect(remoteMain).toBe(observedBaseOid);
+      expect(remoteCandidate).toBe(observedBaseOid);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recognizes an exact published Integration merge from a fresh workspace", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            {
+              cwd: scenario.integrationPath,
+            },
+          )
+        ).stdout.trim(),
+      );
+      const request = {
+        kind: "integration" as const,
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required" as const,
+      };
+      const first =
+        await scenario.botWorkspace.publishIntegrationMerge(request);
+      if (first.kind !== "integrationMerged")
+        throw new Error("publication is required");
+      const replay = await new RealGitWorkspace(
+        runner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge(request);
+      expect(replay).toEqual({
+        kind: "integrationAlreadyApplied",
+        mainOid: first.mainOid,
+      });
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("returns the concurrent exact winner OID after its own atomic push loses", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const winnerPath = `${scenario.root}/concurrent-winner`;
+      await runner.run(["clone", scenario.upstream, winnerPath], {
+        cwd: scenario.root,
+      });
+      let published = false;
+      let winnerOid: ReturnType<typeof oid> | undefined;
+      const racingRunner: GitRunner = {
+        async run(argv, options) {
+          if (!published && argv[0] === "push" && argv.includes("--atomic")) {
+            published = true;
+            await runner.run(["switch", "-C", "main", observedBaseOid], {
+              cwd: winnerPath,
+            });
+            await runner.run(
+              ["merge", "--no-ff", "--no-edit", expectedHeadOid],
+              {
+                cwd: winnerPath,
+                env: {
+                  GIT_AUTHOR_DATE: "2026-08-27T00:00:00Z",
+                  GIT_COMMITTER_DATE: "2026-08-27T00:00:00Z",
+                },
+              },
+            );
+            winnerOid = oid(
+              (
+                await runner.run(["rev-parse", "HEAD"], { cwd: winnerPath })
+              ).stdout.trim(),
+            );
+            await runner.run(
+              [
+                "push",
+                "--porcelain",
+                "--atomic",
+                `--force-with-lease=refs/heads/main:${observedBaseOid}`,
+                `--force-with-lease=refs/heads/feature/card-alice-source-1:${expectedHeadOid}`,
+                "origin",
+                `${winnerOid}:refs/heads/main`,
+                `${expectedHeadOid}:refs/heads/feature/card-alice-source-1`,
+              ],
+              { cwd: winnerPath },
+            );
+          }
+          return runner.run(argv, options);
+        },
+      };
+      const result = await new RealGitWorkspace(
+        racingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+      if (!winnerOid) throw new Error("concurrent winner is required");
+      expect(result).toEqual({
+        kind: "integrationAlreadyApplied",
+        mainOid: winnerOid,
+      });
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recovers a response-lost Integration publication from exact remote readback", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      let loseResponse = true;
+      const responseLosingRunner: GitRunner = {
+        async run(argv, options) {
+          const result = await runner.run(argv, options);
+          if (
+            loseResponse &&
+            argv[0] === "push" &&
+            argv.some((arg) => arg.includes("refs/heads/main"))
+          ) {
+            loseResponse = false;
+            throw new Error("response lost after accepted push");
+          }
+          return result;
+        },
+      };
+      const result = await new RealGitWorkspace(
+        responseLosingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+
+      expect(result).toEqual({
+        kind: "integrationAlreadyApplied",
+        mainOid: expect.any(String),
+      });
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recognizes an applied Integration merge after main advances before response recovery", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const observedBaseOid = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const expectedHeadOid = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      const writerPath = `${scenario.root}/wrong-main-writer`;
+      await runner.run(["clone", scenario.upstream, writerPath], {
+        cwd: scenario.root,
+      });
+      let loseResponse = true;
+      const responseLosingRunner: GitRunner = {
+        async run(argv, options) {
+          const result = await runner.run(argv, options);
+          if (
+            loseResponse &&
+            argv[0] === "push" &&
+            argv.some((arg) => arg.includes("refs/heads/main"))
+          ) {
+            loseResponse = false;
+            await runner.run(["switch", "main"], { cwd: writerPath });
+            await runner.run(["fetch", "origin", "main"], { cwd: writerPath });
+            await runner.run(["switch", "-C", "main", "origin/main"], {
+              cwd: writerPath,
+            });
+            await runner.run(
+              [
+                "commit",
+                "--allow-empty",
+                "--message",
+                "Advance after publication",
+              ],
+              {
+                cwd: writerPath,
+              },
+            );
+            await runner.run(["push", "origin", "HEAD:main"], {
+              cwd: writerPath,
+            });
+            throw new Error("response lost after a different remote result");
+          }
+          return result;
+        },
+      };
+      const result = await new RealGitWorkspace(
+        responseLosingRunner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+
+      expect(result).toEqual({
+        kind: "integrationAlreadyApplied",
+        mainOid: expect.any(String),
+      });
+      if (result.kind !== "integrationAlreadyApplied")
+        throw new Error("publication recovery is required");
+      const replay = await new RealGitWorkspace(
+        runner,
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      ).publishIntegrationMerge({
+        kind: "integration",
+        pullRequestNumber: 2,
+        observedBaseOid,
+        expectedHeadOid,
+        baseCurrentGate: "required",
+      });
+      expect(replay).toEqual({
+        kind: "integrationAlreadyApplied",
+        mainOid: result.mainOid,
+      });
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
   test("writes, restarts from, and recovers an H2-refreshed candidate without another write", async () => {
     const scenario = await createGoodFirstConflictScenario({
       prebuiltIntegration: true,

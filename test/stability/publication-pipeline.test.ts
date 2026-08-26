@@ -116,6 +116,33 @@ function workspace(input: {
   };
 }
 
+function markIntegrationPublished(facts: ReturnType<typeof readyFacts>) {
+  const integration = facts.integrationPullRequest.value;
+  const main = facts.main.value;
+  const card = facts.acceptedCard;
+  if (!integration || !main || !card) throw new Error("fixture is incomplete");
+  const published = oid("main-merged");
+  facts.integrationPullRequest.value = {
+    ...integration,
+    merged: true,
+    closed: true,
+    mergeCommitOid: published,
+    mergeParentOids: [oid("main-1"), integration.headOid],
+  };
+  facts.main.value = {
+    ...main,
+    oid: published,
+    cardManifests: [
+      {
+        path: card.path,
+        blobOid: gitBlobOid(card.bytes),
+        githubId: card.githubId,
+        sourcePrNumber: card.sourcePrNumber,
+      },
+    ],
+  };
+}
+
 describe("L4 H2 and final publication pipeline", () => {
   test("refreshes H2 with the confirmed Card blob when main moved after Confirmation", async () => {
     const facts = readyFacts();
@@ -144,7 +171,7 @@ describe("L4 H2 and final publication pipeline", () => {
     expect(local.mergePullRequest).not.toHaveBeenCalled();
   });
 
-  test("does not report publication without final-main readback", async () => {
+  test("awaits a fresh provider observation after Git publication", async () => {
     const facts = readyFacts();
     const candidate = facts.candidate.value;
     if (!candidate) throw new Error("candidate is required");
@@ -158,6 +185,44 @@ describe("L4 H2 and final publication pipeline", () => {
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "pending" });
+    expect(final).not.toHaveBeenCalled();
+  });
+
+  test("does not emit completion until a fresh observation proves the exact Integration PR merge", async () => {
+    const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
+    const local = platform(facts);
+    const observeRepository = vi.fn(async () => ({
+      status: "ready" as const,
+      provenance: "modeled" as const,
+      value: facts,
+    }));
+    const final = vi.fn(async (expected) => ({
+      status: "ready" as const,
+      value: expected,
+    }));
+
+    await expect(
+      createReconciler({
+        github: {
+          ...local.github,
+          observeRepository,
+        },
+        git: workspace({ final, candidate }),
+        candidatePolicy: testCandidatePolicy,
+      }).reconcile({ budget: { maxEffects: 2 } }),
+    ).resolves.toEqual({ kind: "awaitingExternalFact", reason: "pending" });
+    expect(observeRepository).toHaveBeenCalledOnce();
+    expect(final).not.toHaveBeenCalled();
+    markIntegrationPublished(facts);
+    await expect(
+      createReconciler({
+        github: { ...local.github, observeRepository },
+        git: workspace({ final, candidate }),
+        candidatePolicy: testCandidatePolicy,
+      }).reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({ kind: "quiescent" });
     expect(final).toHaveBeenCalledOnce();
   });
 
@@ -183,10 +248,11 @@ describe("L4 H2 and final publication pipeline", () => {
     expect(local.mergePullRequest).not.toHaveBeenCalled();
   });
 
-  test("returns retryable when final main does not match the required Card and history", async () => {
+  test("fails closed when fresh final main does not match the required Card and history", async () => {
     const facts = readyFacts();
     const candidate = facts.candidate.value;
     if (!candidate) throw new Error("candidate is required");
+    markIntegrationPublished(facts);
     const local = platform(facts);
     const final = vi.fn(async () => ({
       status: "ready" as const,
@@ -210,7 +276,50 @@ describe("L4 H2 and final publication pipeline", () => {
         git: workspace({ final, candidate }),
         candidatePolicy: testCandidatePolicy,
       }).reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({ kind: "terminal", reason: "policyRejected" });
+  });
+
+  test("retries when main advances after provider observation but before final Git readback", async () => {
+    const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
+    markIntegrationPublished(facts);
+    const local = platform(facts);
+    const final = vi.fn(async (expected) => ({
+      status: "ready" as const,
+      value: { ...expected, mainOid: oid("newer-main") },
+    }));
+
+    await expect(
+      createReconciler({
+        github: local.github,
+        git: workspace({ final, candidate }),
+        candidatePolicy: testCandidatePolicy,
+      }).reconcile({ budget: { maxEffects: 1 } }),
     ).resolves.toEqual({ kind: "retryable", reason: "stalePrecondition" });
+  });
+
+  test("fails closed when the same main OID has corrupt final semantics", async () => {
+    const facts = readyFacts();
+    const candidate = facts.candidate.value;
+    if (!candidate) throw new Error("candidate is required");
+    markIntegrationPublished(facts);
+    const local = platform(facts);
+    const final = vi.fn(async (expected) => ({
+      status: "ready" as const,
+      value: {
+        ...expected,
+        cardManifest: { ...expected.cardManifest, blobOid: oid("wrong-card") },
+      },
+    }));
+
+    await expect(
+      createReconciler({
+        github: local.github,
+        git: workspace({ final, candidate }),
+        candidatePolicy: testCandidatePolicy,
+      }).reconcile({ budget: { maxEffects: 1 } }),
+    ).resolves.toEqual({ kind: "terminal", reason: "policyRejected" });
   });
 
   test("returns quiescent only after final main Card, README, and history readback match", async () => {
@@ -218,6 +327,7 @@ describe("L4 H2 and final publication pipeline", () => {
     const candidate = facts.candidate.value;
     const card = facts.acceptedCard;
     if (!candidate || !card) throw new Error("fixture candidate is required");
+    markIntegrationPublished(facts);
     const local = platform(facts);
     const final = vi.fn(
       async (expected: {

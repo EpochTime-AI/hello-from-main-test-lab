@@ -483,6 +483,7 @@ describe("Core comment contracts", () => {
       closed: true,
       merged: true,
       mergeCommitOid: oid("integration-merge"),
+      mergeParentOids: [oid("main-1"), integration.headOid],
     };
     const intents: string[] = [];
     let merges = 0;
@@ -572,6 +573,7 @@ describe("Core comment contracts", () => {
       closed: true,
       merged: true,
       mergeCommitOid: oid("integration-merge"),
+      mergeParentOids: [oid("main-1"), integration.headOid],
     };
     let sourceAttempts = 0;
     let merges = 0;
@@ -763,6 +765,7 @@ describe("Core comment contracts", () => {
           merged: true,
           closed: true,
           mergeCommitOid: oid("0123456789abcdef0123456789abcdef01234567"),
+          mergeParentOids: [main.oid, integration.headOid],
         };
         facts.main.value = {
           ...main,
@@ -808,16 +811,33 @@ describe("Core comment contracts", () => {
     };
 
     const diagnostics: unknown[] = [];
-    const result = await createReconciler({
+    const reconciler = createReconciler({
       github,
       git,
       candidatePolicy: testCandidatePolicy,
-    }).reconcile({
+    });
+    const publicationResult = await reconciler.reconcile({
       budget: { maxEffects: 8 },
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     });
 
-    expect(result, JSON.stringify({ diagnostics, intents, merges })).toEqual({
+    expect(
+      publicationResult,
+      JSON.stringify({ diagnostics, intents, merges }),
+    ).toEqual({
+      kind: "awaitingExternalFact",
+      reason: "pending",
+    });
+
+    const completionResult = await reconciler.reconcile({
+      budget: { maxEffects: 3 },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    expect(
+      completionResult,
+      JSON.stringify({ diagnostics, intents, merges }),
+    ).toEqual({
       kind: "quiescent",
     });
     expect(merges).toBe(1);
