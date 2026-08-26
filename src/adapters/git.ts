@@ -15,6 +15,8 @@ import type {
   CandidateWriteResult,
   CardManifest,
   FinalMainPostconditions,
+  IntegrationMergeRequest,
+  IntegrationMergeResult,
   Observation,
   Oid,
   WorkspaceReadback,
@@ -844,6 +846,142 @@ export class RealGitWorkspace {
     return { mergeCommitOid, parents };
   }
 
+  async publishIntegrationMerge(
+    request: IntegrationMergeRequest,
+    context?: { signal?: AbortSignal },
+  ): Promise<IntegrationMergeResult> {
+    this.activeSignal = context?.signal;
+    if (request.baseCurrentGate !== "required")
+      return { kind: "integrationRejected", reason: "gateUnsupported" };
+    try {
+      await git(
+        this.runner,
+        this.cwd,
+        "fetch",
+        this.remote,
+        "refs/heads/main:refs/remotes/origin/main",
+        `+refs/heads/${this.branch}:refs/remotes/origin/${this.branch}`,
+      );
+      const observedMain = oid(
+        await git(this.runner, this.cwd, "rev-parse", "origin/main"),
+      );
+      const expectedTreeOid = oid(
+        await git(
+          this.runner,
+          this.cwd,
+          "rev-parse",
+          `${request.expectedHeadOid}^{tree}`,
+        ),
+      );
+      const existing = await findPublishedIntegrationMerge(
+        this.runner,
+        this.cwd,
+        observedMain,
+        request,
+        expectedTreeOid,
+      );
+      if (existing.kind === "exact")
+        return { kind: "integrationAlreadyApplied", mainOid: existing.oid };
+      if (existing.kind === "ambiguous")
+        return { kind: "integrationRejected", reason: "unknownOutcome" };
+      if (observedMain !== request.observedBaseOid)
+        return { kind: "integrationRejected", reason: "baseMoved" };
+      const observedCandidateOid = oid(
+        await git(this.runner, this.cwd, "rev-parse", `origin/${this.branch}`),
+      );
+      if (observedCandidateOid !== request.expectedHeadOid)
+        return { kind: "integrationRejected", reason: "stalePrecondition" };
+      await git(this.runner, this.cwd, "switch", "-C", "main", observedMain);
+      try {
+        await git(
+          this.runner,
+          this.cwd,
+          "merge",
+          "--no-ff",
+          "--no-edit",
+          observedCandidateOid,
+        );
+      } catch (error) {
+        await git(this.runner, this.cwd, "merge", "--abort").catch(
+          () => undefined,
+        );
+        throw error;
+      }
+      const proposedMergeOid = oid(
+        await git(this.runner, this.cwd, "rev-parse", "HEAD"),
+      );
+      if (
+        !(await integrationMergeMatches(
+          this.runner,
+          this.cwd,
+          proposedMergeOid,
+          request,
+          expectedTreeOid,
+        ))
+      )
+        return { kind: "integrationRejected", reason: "gateRejected" };
+      try {
+        await git(
+          this.runner,
+          this.cwd,
+          "push",
+          "--porcelain",
+          "--atomic",
+          `--force-with-lease=refs/heads/main:${request.observedBaseOid}`,
+          `--force-with-lease=refs/heads/${this.branch}:${request.expectedHeadOid}`,
+          this.remote,
+          `${proposedMergeOid}:refs/heads/main`,
+          `${request.expectedHeadOid}:refs/heads/${this.branch}`,
+        );
+      } catch (error) {
+        const readback = await readIntegrationPublication(
+          this.runner,
+          this.cwd,
+          this.remote,
+          this.branch,
+          proposedMergeOid,
+          request,
+          expectedTreeOid,
+        );
+        if (readback.kind === "applied")
+          return { kind: "integrationAlreadyApplied", mainOid: readback.oid };
+        const readbackReason = integrationReadbackRejectionReason(readback);
+        return {
+          kind: "integrationRejected",
+          reason:
+            readbackReason === "unknownOutcome" &&
+            error instanceof GitCommandError &&
+            isPolicyRejection(error)
+              ? "policyRejected"
+              : readbackReason,
+        };
+      }
+      const readback = await readIntegrationPublication(
+        this.runner,
+        this.cwd,
+        this.remote,
+        this.branch,
+        proposedMergeOid,
+        request,
+        expectedTreeOid,
+      );
+      if (readback.kind === "applied")
+        return { kind: "integrationMerged", mainOid: readback.oid };
+      return {
+        kind: "integrationRejected",
+        reason: integrationReadbackRejectionReason(readback),
+      };
+    } catch (error) {
+      return {
+        kind: "integrationRejected",
+        reason:
+          error instanceof GitCommandError && isPolicyRejection(error)
+            ? "policyRejected"
+            : "retryableTransport",
+      };
+    }
+  }
+
   async isAncestor(
     ancestor: Oid,
     descendant: string,
@@ -881,6 +1019,136 @@ export class RealGitWorkspace {
 function gitCommandFailureDetail(error: GitCommandError): string {
   const operation = error.result.argv[0] ?? "unknown";
   return `operation=${operation}; status=${error.result.status}; category=local-git`;
+}
+
+type IntegrationPublicationReadback =
+  | { kind: "applied"; oid: Oid }
+  | { kind: "baseMoved" | "staleCandidate" | "inconclusive" };
+
+async function readIntegrationPublication(
+  runner: GitRunner,
+  cwd: string,
+  remote: string,
+  branch: string,
+  mergeOid: Oid,
+  request: IntegrationMergeRequest,
+  expectedTreeOid: Oid,
+): Promise<IntegrationPublicationReadback> {
+  try {
+    await git(
+      runner,
+      cwd,
+      "fetch",
+      remote,
+      "refs/heads/main:refs/remotes/origin/main",
+      `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    );
+    const remoteMain = oid(await git(runner, cwd, "rev-parse", "origin/main"));
+    const remoteCandidate = oid(
+      await git(runner, cwd, "rev-parse", `origin/${branch}`),
+    );
+    if (remoteMain === mergeOid)
+      return (await integrationMergeMatches(
+        runner,
+        cwd,
+        mergeOid,
+        request,
+        expectedTreeOid,
+      ))
+        ? { kind: "applied", oid: mergeOid }
+        : { kind: "inconclusive" };
+    const existing = await findPublishedIntegrationMerge(
+      runner,
+      cwd,
+      remoteMain,
+      request,
+      expectedTreeOid,
+    );
+    if (existing.kind === "exact")
+      return { kind: "applied", oid: existing.oid };
+    if (existing.kind === "ambiguous") return { kind: "inconclusive" };
+    if (
+      remoteMain === request.observedBaseOid &&
+      remoteCandidate !== request.expectedHeadOid
+    )
+      return { kind: "staleCandidate" };
+    return remoteMain === request.observedBaseOid
+      ? { kind: "inconclusive" }
+      : { kind: "baseMoved" };
+  } catch {
+    return { kind: "inconclusive" };
+  }
+}
+
+function integrationReadbackRejectionReason(
+  readback: Exclude<IntegrationPublicationReadback, { kind: "applied" }>,
+): "baseMoved" | "stalePrecondition" | "unknownOutcome" {
+  if (readback.kind === "baseMoved") return "baseMoved";
+  if (readback.kind === "staleCandidate") return "stalePrecondition";
+  return "unknownOutcome";
+}
+
+async function findPublishedIntegrationMerge(
+  runner: GitRunner,
+  cwd: string,
+  mainOid: Oid,
+  request: IntegrationMergeRequest,
+  expectedTreeOid: Oid,
+): Promise<
+  { kind: "none" } | { kind: "exact"; oid: Oid } | { kind: "ambiguous" }
+> {
+  const commits = (
+    await git(runner, cwd, "rev-list", "--max-count=256", mainOid)
+  )
+    .split("\n")
+    .filter(Boolean)
+    .map(oid);
+  const matches: Oid[] = [];
+  for (const commit of commits) {
+    if (
+      await integrationMergeMatches(
+        runner,
+        cwd,
+        commit,
+        request,
+        expectedTreeOid,
+      )
+    )
+      matches.push(commit);
+  }
+  if (matches.length === 0) return { kind: "none" };
+  if (matches.length === 1 && matches[0])
+    return { kind: "exact", oid: matches[0] };
+  return { kind: "ambiguous" };
+}
+
+async function integrationMergeMatches(
+  runner: GitRunner,
+  cwd: string,
+  mergeOid: Oid,
+  request: IntegrationMergeRequest,
+  expectedTree: Oid,
+): Promise<boolean> {
+  const parents = (
+    await git(runner, cwd, "rev-list", "--parents", "-n", "1", mergeOid)
+  )
+    .split(" ")
+    .slice(1)
+    .filter(Boolean)
+    .map(oid);
+  const tree = oid(await git(runner, cwd, "rev-parse", `${mergeOid}^{tree}`));
+  return (
+    parents.length === 2 &&
+    parents[0] === request.observedBaseOid &&
+    parents[1] === request.expectedHeadOid &&
+    tree === expectedTree
+  );
+}
+
+function isPolicyRejection(error: GitCommandError): boolean {
+  return /protected branch|hook declined|GH006|denied|permission/i.test(
+    error.result.stderr,
+  );
 }
 
 function oidFromBytes(bytes: Uint8Array): Oid {

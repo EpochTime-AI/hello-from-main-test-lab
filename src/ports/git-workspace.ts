@@ -2,6 +2,8 @@ import type {
   CandidateWrite,
   CandidateWriteResult,
   FinalMainPostconditions,
+  IntegrationMergeRequest,
+  IntegrationMergeResult,
   Observation,
   Oid,
   WorkspaceReadback,
@@ -24,6 +26,10 @@ export type GitWorkspace = {
     candidate: CandidateWrite,
     context?: InvocationContext,
   ): Promise<CandidateWriteResult>;
+  publishIntegrationMerge?(
+    request: IntegrationMergeRequest,
+    context?: InvocationContext,
+  ): Promise<IntegrationMergeResult>;
   readFinalMainPostconditions(
     expected: FinalMainPostconditions,
     context?: InvocationContext,

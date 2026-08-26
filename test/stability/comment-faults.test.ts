@@ -33,6 +33,7 @@ function publishedFacts() {
     merged: true,
     closed: true,
     mergeCommitOid: mainOid,
+    mergeParentOids: [oid("main-1"), integration.headOid],
   };
   facts.main.value = {
     ...main,
