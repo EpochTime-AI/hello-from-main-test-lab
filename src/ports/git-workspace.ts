@@ -16,8 +16,12 @@ export type GitWorkspace = {
     fromMainOid: Oid;
     cardPath: string;
     cardBytes: Uint8Array;
+    setupOperationNonce?: string;
   }) => Promise<{
     branch: { name: string; headOid: Oid; provenance: "observed" };
+    establishedByCurrentOperation?: true;
+    setupOperationNonce?: string;
+    setupProjectShellProof?: import("../adapters/git.js").SetupProjectShellProof;
   }>;
   readWorkspace(
     context?: InvocationContext,

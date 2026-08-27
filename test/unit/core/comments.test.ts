@@ -430,6 +430,116 @@ describe("Core comment contracts", () => {
     expect(intents).toEqual(["1:source-status:setup"]);
   });
 
+  test.each([
+    [
+      "author/fork",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        const source = facts.sourcePullRequest.value;
+        if (!source) throw new Error("source is required");
+        facts.sourcePullRequest.value = {
+          ...source,
+          headRepositoryIsFork: false,
+        };
+      },
+    ],
+    [
+      "ref/path",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        const source = facts.sourcePullRequest.value;
+        if (!source) throw new Error("source is required");
+        facts.sourcePullRequest.value = { ...source, headRef: "wrong" };
+      },
+    ],
+    [
+      "scope",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        const source = facts.sourcePullRequest.value;
+        if (!source) throw new Error("source is required");
+        facts.sourcePullRequest.value = {
+          ...source,
+          changedFilesComplete: false,
+        };
+      },
+    ],
+    [
+      "identity/metadata",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        facts.publishedGithubIds = ["7"];
+      },
+    ],
+    [
+      "grammar/template",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        const source = facts.sourcePullRequest.value;
+        if (!source?.changedFiles?.[0]) throw new Error("Card is required");
+        facts.sourcePullRequest.value = {
+          ...source,
+          changedFiles: [
+            {
+              ...source.changedFiles[0],
+              bytes: new TextEncoder().encode("bad\n"),
+            },
+          ],
+        };
+      },
+    ],
+    [
+      "safety",
+      (facts: ReturnType<typeof stabilityFacts>) => {
+        const source = facts.sourcePullRequest.value;
+        if (!source?.changedFiles?.[0]) throw new Error("Card is required");
+        facts.sourcePullRequest.value = {
+          ...source,
+          changedFiles: [
+            {
+              ...source.changedFiles[0],
+              bytes: new TextEncoder().encode(
+                "---\ngithub: alice\ngithub_id: 7\navatar: https://avatars.githubusercontent.com/u/7?v=4\nsource_pr: 1\n---\n\n# Alice\n\n最近在折腾：[unsafe](https://example.test)\n\n> Hi\n",
+              ),
+            },
+          ],
+        };
+      },
+    ],
+  ] as const)(
+    "does not send setup guidance for invalid pre-rebase %s intake",
+    async (_name, mutate) => {
+      const facts = stabilityFacts();
+      const source = facts.sourcePullRequest.value;
+      if (!source) throw new Error("source is required");
+      facts.sourcePullRequest.value = {
+        ...source,
+        merged: false,
+        closed: false,
+      };
+      facts.sourceHeadBasedOnIntegration = { status: "incomplete" };
+      mutate(facts);
+      const intents: CommentIntent[] = [];
+      const result = await createReconciler({
+        github: {
+          observeRepository: async () => ({ status: "ready", value: facts }),
+          ensureComment: async (intent: CommentIntent) => {
+            intents.push(intent);
+            return { kind: "capabilityUnavailable" };
+          },
+        } as unknown as GithubPlatform,
+        git: {
+          readWorkspace: async () => ({
+            status: "ready",
+            value: {
+              status: "ready",
+              integrationHeadOid: oid("integration-1"),
+            },
+          }),
+        } as unknown as GitWorkspace,
+        candidatePolicy: testCandidatePolicy,
+      }).reconcile({ budget: { maxEffects: 1 } });
+
+      expect(intents.filter((intent) => intent.phase === "setup")).toEqual([]);
+      expect(result).not.toEqual({ kind: "quiescent" });
+    },
+  );
+
   test("C-C1/C-C2 publish once, then complete source and Integration targets independently", async () => {
     const facts = stabilityFacts();
     const source = facts.sourcePullRequest.value;

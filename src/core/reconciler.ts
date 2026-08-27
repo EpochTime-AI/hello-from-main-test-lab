@@ -47,6 +47,7 @@ export type Reconciler = {
 };
 
 type CommentEffect = { kind: "ensureComment"; intent: CommentIntent };
+type SetupCommentLifecycle = "none" | "awaiting-comment" | "comment-satisfied";
 
 export function validateIntake(
   facts: RepositoryFacts,
@@ -198,6 +199,7 @@ export function createReconciler(dependencies: {
     async reconcile({ budget, onDiagnostic }) {
       let effects = 0;
       let turn = 0;
+      let setupCommentLifecycle: SetupCommentLifecycle = "none";
       while (effects < budget.maxEffects) {
         turn += 1;
         let observed: Observation<RepositoryFacts>;
@@ -236,6 +238,14 @@ export function createReconciler(dependencies: {
         }
         if (observed.status !== "ready" || !observed.value) {
           const outcome = observationOutcome(observed.status);
+          if (
+            setupCommentLifecycle === "awaiting-comment" &&
+            (observed.status === "incomplete" ||
+              observed.status === "notVisibleYet")
+          ) {
+            effects += 1;
+            continue;
+          }
           onDiagnostic?.({ turn, outcome });
           return outcome;
         }
@@ -267,13 +277,18 @@ export function createReconciler(dependencies: {
         }
         if (terminal) {
           effects += 1;
-          let outcome: ReconcileOutcome | undefined;
+          let outcome:
+            | ReconcileOutcome
+            | { kind: "setupEstablished" }
+            | undefined;
           try {
             outcome = await executeEffect(terminal, dependencies, budget);
           } catch {
             outcome = { kind: "retryable", reason: "unknownOutcome" };
           }
           if (!outcome) continue;
+          if (outcome.kind === "setupEstablished")
+            return { kind: "terminal", reason: "policyRejected" };
           onDiagnostic?.({ turn, effect: terminal.kind, outcome });
           return outcome;
         }
@@ -282,6 +297,7 @@ export function createReconciler(dependencies: {
           workspace.value,
           dependencies.candidatePolicy,
           commentsSupported,
+          setupCommentLifecycle === "comment-satisfied",
         );
         if (
           derived?.kind === "awaitingExternalFact" ||
@@ -289,6 +305,17 @@ export function createReconciler(dependencies: {
           derived?.kind === "terminal" ||
           derived?.kind === "budgetExhausted"
         ) {
+          if (
+            derived.kind === "awaitingExternalFact" &&
+            setupCommentLifecycle === "awaiting-comment"
+          ) {
+            // A setup mutation authorizes only this adapter instance to create
+            // its setup comment. Keep observing within this bounded run until
+            // that permit can be consumed, rather than stranding it on a
+            // provider visibility gap for a fresh process to discover.
+            effects += 1;
+            continue;
+          }
           onDiagnostic?.({ turn, outcome: derived });
           return derived;
         }
@@ -311,13 +338,28 @@ export function createReconciler(dependencies: {
         }
 
         effects += 1;
-        let outcome: ReconcileOutcome | undefined;
+        let outcome:
+          | ReconcileOutcome
+          | { kind: "setupEstablished" }
+          | undefined;
         try {
           outcome = await executeEffect(effect, dependencies, budget);
         } catch {
           outcome = { kind: "retryable", reason: "unknownOutcome" };
         }
-        if (!outcome) continue;
+        if (!outcome) {
+          if (
+            effect.kind === "ensureComment" &&
+            effect.intent.phase === "setup"
+          )
+            setupCommentLifecycle = "comment-satisfied";
+          continue;
+        }
+        if (outcome.kind === "setupEstablished") {
+          if (effect.kind === "createBranch")
+            setupCommentLifecycle = "awaiting-comment";
+          continue;
+        }
         onDiagnostic?.({ turn, effect: effect.kind, outcome });
         if (
           outcome.kind === "terminal" ||
@@ -360,6 +402,7 @@ function deriveEffect(
   workspace: WorkspaceReadback,
   candidatePolicy: Parameters<typeof createReconciler>[0]["candidatePolicy"],
   commentsSupported: boolean,
+  setupCommentSatisfied: boolean,
 ): Effect | ReconcileOutcome | undefined {
   const source = facts.sourcePullRequest.value;
   const branch = facts.integrationBranch.value;
@@ -400,35 +443,63 @@ function deriveEffect(
   if (!integration && facts.integrationPullRequest.status === "absent")
     return { kind: "createIntegrationPr", branchName };
   if (!branchHeadOid || !integration) return undefined;
-  if (!source.merged && source.baseOid !== branchHeadOid) {
+  if (
+    !source.merged &&
+    (integration.headOid !== branchHeadOid ||
+      integration.baseOid !== main.oid ||
+      !integration.draft)
+  )
+    return { kind: "terminal", reason: "policyRejected" };
+  if (
+    !source.merged &&
+    (source.baseOid !== branchHeadOid || source.baseRef !== branchName)
+  ) {
     return { kind: "retarget", pullRequestNumber: source.number, branchName };
   }
-  if (
-    facts.sourceHeadBasedOnIntegration?.status !== "ready" ||
-    !facts.sourceHeadBasedOnIntegration.value
-  )
-    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (
     commentsSupported &&
     (!source.authorGithubId || !facts.trustedCommentOwner)
   )
     return { kind: "terminal", reason: "permissionDenied" };
-  const setupComment = commentsSupported
-    ? commentEffect(
-        facts,
-        source.number,
-        "source-status",
-        "setup",
-        renderSetupComment({
-          runIdentity: runIdentity(source),
-          sourcePullRequestNumber: source.number,
-          integrationBranchName: branchName,
-          integrationPullRequestNumber: integration.number,
-          rebaseCommand: `git rebase upstream/${branchName}`,
-        }),
-      )
-    : undefined;
+  if (!validBeforeRebase(validation)) {
+    const feedback = commentsSupported
+      ? commentEffect(
+          facts,
+          source.number,
+          "source-status",
+          "validation-feedback",
+          renderValidationComment({
+            runIdentity: runIdentity(source),
+            sourcePullRequestNumber: source.number,
+            sourceHeadOid: source.headOid,
+            result: validation,
+          }),
+        )
+      : undefined;
+    return feedback ?? { kind: "terminal", reason: "policyRejected" };
+  }
+  const setupComment =
+    commentsSupported && !setupCommentSatisfied
+      ? commentEffect(
+          facts,
+          source.number,
+          "source-status",
+          "setup",
+          renderSetupComment({
+            runIdentity: runIdentity(source),
+            sourcePullRequestNumber: source.number,
+            integrationBranchName: branchName,
+            integrationPullRequestNumber: integration.number,
+            rebaseCommand: `git rebase upstream/${branchName}`,
+          }),
+        )
+      : undefined;
   if (setupComment) return setupComment;
+  if (
+    facts.sourceHeadBasedOnIntegration?.status !== "ready" ||
+    !facts.sourceHeadBasedOnIntegration.value
+  )
+    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (validation.kind === "invalid") {
     const feedback = commentsSupported
       ? commentEffect(
@@ -683,6 +754,15 @@ function deriveEffect(
   return undefined;
 }
 
+function validBeforeRebase(validation: ValidationResult): boolean {
+  return (
+    validation.kind === "valid" ||
+    validation.issues.every(
+      (issue) => issue.category === "integration-base-or-ancestry",
+    )
+  );
+}
+
 function providerEligible(
   facts: RepositoryFacts,
   pullRequestNumber: number,
@@ -831,7 +911,7 @@ async function executeEffect(
     invocationContext?: InvocationContext;
   },
   budget: ReconcileBudget,
-): Promise<ReconcileOutcome | undefined> {
+): Promise<ReconcileOutcome | { kind: "setupEstablished" } | undefined> {
   if (effect.kind === "ensureComment") {
     const result = await withinBudget(budget, (context) =>
       dependencies.github.ensureComment(effect.intent, context),
@@ -891,15 +971,19 @@ async function executeEffect(
       return { kind: "retryable", reason: "stalePrecondition" };
     return undefined;
   }
-  if (effect.kind === "createBranch")
-    return operationOutcome(
-      await withinBudget(budget, (context) =>
-        dependencies.github.createIntegrationBranch(effect, {
-          ...context,
-          ...dependencies.invocationContext,
-        }),
-      ),
+  if (effect.kind === "createBranch") {
+    const result = await withinBudget(budget, (context) =>
+      dependencies.github.createIntegrationBranch(effect, {
+        ...context,
+        ...dependencies.invocationContext,
+      }),
     );
+    if (result.kind !== "succeeded" && result.kind !== "alreadyApplied")
+      return operationCategoryOutcome(result.kind);
+    return result.value.setupEstablishedByCurrentOperation
+      ? { kind: "setupEstablished" }
+      : undefined;
+  }
   if (effect.kind === "createIntegrationPr")
     return operationOutcome(
       await withinBudget(budget, (context) =>

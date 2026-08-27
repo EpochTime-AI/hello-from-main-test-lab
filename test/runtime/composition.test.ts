@@ -108,6 +108,39 @@ describe("runtime composition", () => {
     );
   });
 
+  test("does not add setup authority when production setup is bound to a non-Octokit platform", async () => {
+    const octokit = {
+      createIntegrationBranch: vi.fn(),
+    } as unknown as GithubPlatform;
+    const workspace = {
+      createIntegrationBranchWithProjectShell: vi.fn(async (input) => ({
+        branch: {
+          name: "feature/card-alice-source-1",
+          headOid: oid("shell-commit"),
+          provenance: "observed" as const,
+        },
+        establishedByCurrentOperation: true as const,
+        ...(input.setupOperationNonce
+          ? { setupOperationNonce: input.setupOperationNonce }
+          : {}),
+      })),
+    } as unknown as import("../../src/adapters/git.js").RealGitWorkspace;
+    const platform = bindProductionSetup(
+      octokit,
+      {
+        remote: "origin",
+        branch: "feature/card-alice-source-1",
+        sourcePullRequestNumber: 1,
+        sourceLogin: "alice",
+        commentOwner: { actorId: "42", actorType: "Bot" },
+      },
+      workspace,
+    );
+    expect(
+      (platform as Record<string, unknown>).recordSetupProjectShell,
+    ).toBeUndefined();
+  });
+
   test("disposes authentication when repository identity setup fails", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "hello-from-main-runtime-"));
     const eventPath = join(workspace, "event.json");

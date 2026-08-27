@@ -19,6 +19,7 @@ import type {
   GithubPlatform,
   InvocationContext,
 } from "../ports/github-platform.js";
+import { isSetupProjectShellProof, type RealGitWorkspace } from "./git.js";
 
 type RestMethod = "GET" | "POST" | "PATCH" | "PUT";
 type RestRequest = {
@@ -71,6 +72,16 @@ export type OctokitIntegrationPublicationRecorder = {
     result: IntegrationMergeResult,
   ): void;
 };
+
+type SetupGrant = (input: {
+  operationNonce: string;
+  sourcePullRequestNumber: number;
+  sourceLogin: string;
+  branchName: string;
+  proof: import("./git.js").SetupProjectShellProof;
+}) => boolean;
+
+const setupGrants = new WeakMap<object, SetupGrant>();
 
 export type OctokitGithubPlatformOptions = {
   owner: string;
@@ -125,6 +136,7 @@ export function createOctokitGithubPlatform(
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = new Set<string>();
   const commentCreatePermits: CommentCreatePermit[] = [];
+  const consumedSetupProofs = new WeakSet<object>();
   const path = (suffix: string) =>
     `/repos/${options.owner}/${options.repo}${suffix}`;
   const apiCommentPath = (suffix: string) => path(suffix);
@@ -449,18 +461,10 @@ export function createOctokitGithubPlatform(
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return grantSetupCommentCreatePermit({
+        return {
           kind: "succeeded",
           value: { branch: branchFromResponse(response.data, input.name) },
-        });
-      if (response.status === 422) {
-        try {
-          const branch = await readBranch(input.name);
-          return { kind: "alreadyApplied", value: { branch } };
-        } catch {
-          /* response may have been lost before the ref became visible */
-        }
-      }
+        };
       return operationFailure(response);
     },
     async createIntegrationPullRequest(
@@ -513,10 +517,10 @@ export function createOctokitGithubPlatform(
                   )
               : undefined;
             if (found)
-              return grantSetupCommentCreatePermit({
+              return {
                 kind: "alreadyApplied",
                 value: { pullRequest: pullRequestFact(found, "integration") },
-              });
+              };
           } catch {
             // The provider may still be converging; retain unknown outcome.
           }
@@ -524,10 +528,10 @@ export function createOctokitGithubPlatform(
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return grantSetupCommentCreatePermit({
+        return {
           kind: "succeeded",
           value: { pullRequest: pullRequestFact(response.data, "integration") },
-        });
+        };
       return operationFailure(response);
     },
     async updatePullRequestBase(
@@ -549,16 +553,35 @@ export function createOctokitGithubPlatform(
           "mutation",
         );
       } catch (error) {
+        if (
+          error instanceof OctokitOperationError &&
+          error.category === "unknownOutcome"
+        ) {
+          try {
+            const response = await requestRest(
+              {
+                method: "GET",
+                path: path(`/pulls/${input.pullRequestNumber}`),
+              },
+              "read",
+            );
+            const updated = pullRequestFact(response.data, "contribution");
+            if (
+              updated.number === input.pullRequestNumber &&
+              updated.baseRef === input.integrationBranchName
+            )
+              return { kind: "alreadyApplied", value: updated };
+          } catch {
+            // The provider may still be converging; retain unknown outcome.
+          }
+        }
         return operationFailure(error);
       }
       if (response.status === 200) {
         const updated = pullRequestFact(response.data, "contribution");
         if (updated.baseRef !== input.integrationBranchName)
           return { kind: "stalePrecondition" };
-        return grantSetupCommentCreatePermit({
-          kind: "succeeded",
-          value: updated,
-        });
+        return { kind: "succeeded", value: updated };
       }
       return operationFailure(response);
     },
@@ -786,6 +809,32 @@ export function createOctokitGithubPlatform(
       }
     },
   };
+  setupGrants.set(platform, (input) => {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    const canonicalBranch = source
+      ? `feature/card-${source.authorLogin ?? "source"}-source-${source.number}`
+      : undefined;
+    if (
+      !source?.authorGithubId ||
+      input.sourcePullRequestNumber !== source.number ||
+      input.sourceLogin !== source.authorLogin ||
+      input.branchName !== canonicalBranch ||
+      !isSetupProjectShellProof(input.proof) ||
+      input.proof.operationNonce !== input.operationNonce ||
+      consumedSetupProofs.has(input.proof) ||
+      input.proof.branchName !== canonicalBranch ||
+      !input.proof.branchHeadOid
+    )
+      return false;
+    consumedSetupProofs.add(input.proof);
+    grantCommentCreatePermit({
+      targetPullRequestNumber: source.number,
+      slot: "source-status",
+      phase: "setup",
+      milestone: "setup",
+    });
+    return true;
+  });
   return platform as GithubPlatform & OctokitIntegrationPublicationRecorder;
 
   async function mergeRequest(
@@ -1611,18 +1660,6 @@ export function createOctokitGithubPlatform(
     }
   }
 
-  function grantSetupCommentCreatePermit<T>(result: T): T {
-    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
-    if (source)
-      grantCommentCreatePermit({
-        targetPullRequestNumber: source.number,
-        slot: "source-status",
-        phase: "setup",
-        milestone: "setup",
-      });
-    return result;
-  }
-
   function grantCommentCreatePermit(input: {
     targetPullRequestNumber: number;
     slot: "source-status" | "integration-status";
@@ -1739,6 +1776,68 @@ export function createOctokitGithubPlatform(
       );
     }
   }
+}
+
+export function bindProductionSetupAuthority(
+  github: GithubPlatform & OctokitIntegrationPublicationRecorder,
+  workspace: RealGitWorkspace,
+  runtime: {
+    branch: string;
+    sourcePullRequestNumber: number;
+    sourceLogin: string;
+  },
+): GithubPlatform & OctokitIntegrationPublicationRecorder {
+  const grant = setupGrants.get(github);
+  if (!grant) return github;
+  const operationNonce = crypto.randomUUID();
+  return {
+    ...github,
+    async createIntegrationBranch(input, _context) {
+      if (!input.cardPath || !input.cardBytes)
+        return {
+          kind: "retryableTransport",
+          detail: "Project Shell bytes are required",
+        };
+      try {
+        const result = await workspace.createIntegrationBranchWithProjectShell({
+          name: runtime.branch,
+          fromMainOid: oid(input.fromMainOid),
+          cardPath: input.cardPath,
+          cardBytes: input.cardBytes,
+          setupOperationNonce: operationNonce,
+        });
+        const setupEstablished =
+          "establishedByCurrentOperation" in result &&
+          result.establishedByCurrentOperation &&
+          "setupOperationNonce" in result &&
+          result.setupOperationNonce === operationNonce &&
+          "setupProjectShellProof" in result &&
+          isSetupProjectShellProof(result.setupProjectShellProof) &&
+          result.setupProjectShellProof.operationNonce === operationNonce &&
+          grant({
+            operationNonce,
+            sourcePullRequestNumber: runtime.sourcePullRequestNumber,
+            sourceLogin: runtime.sourceLogin,
+            branchName: runtime.branch,
+            proof: result.setupProjectShellProof,
+          });
+        return {
+          kind: setupEstablished ? "succeeded" : "alreadyApplied",
+          value: {
+            branch: result.branch,
+            ...(setupEstablished
+              ? { setupEstablishedByCurrentOperation: true as const }
+              : {}),
+          },
+        };
+      } catch (error) {
+        return {
+          kind: "retryableTransport",
+          detail: `Project Shell setup failed: ${error instanceof Error ? error.message : "unknown"}`,
+        };
+      }
+    },
+  };
 }
 
 function milestoneForCommentPhase(

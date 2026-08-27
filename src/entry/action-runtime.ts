@@ -6,7 +6,9 @@ import {
   RealGitWorkspace,
 } from "../adapters/git.js";
 import {
+  bindProductionSetupAuthority,
   createOctokitGithubPlatform,
+  type OctokitIntegrationPublicationRecorder,
   type OctokitRequestTransport,
 } from "../adapters/octokit.js";
 import type {
@@ -157,7 +159,7 @@ async function runProductionComposition(input: {
       candidatePolicy: productionCandidatePolicy,
       invocationContext: sourceContext,
     });
-    const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
+    const outcome = await composition.run({ maxEffects: 12 }, (diagnostic) => {
       process.stdout.write(
         `${JSON.stringify({
           kind: "hello-from-main-diagnostic",
@@ -347,6 +349,11 @@ export function bindProductionSetup(
   runtime: IntegrationRuntimeConfig,
   workspace: RealGitWorkspace,
 ): GithubPlatform {
+  const setupGithub = bindProductionSetupAuthority(
+    github as GithubPlatform & OctokitIntegrationPublicationRecorder,
+    workspace,
+    runtime,
+  );
   function mergePullRequest(
     request: ContributionMergeRequest,
     context?: InvocationContext,
@@ -377,38 +384,8 @@ export function bindProductionSetup(
     return github.mergePullRequest(request, context);
   }
   return {
-    ...github,
+    ...setupGithub,
     mergePullRequest,
-    async createIntegrationBranch(input, _context) {
-      // The RealGitWorkspace is authoritative for the shell commit. The provider
-      // ref call remains the durable anchor/readback path and is idempotent when
-      // the shell push won the race or the previous response was lost.
-      if (!input.cardPath || !input.cardBytes)
-        return {
-          kind: "retryableTransport",
-          detail: "Project Shell bytes are required",
-        };
-      try {
-        const result = await workspace.createIntegrationBranchWithProjectShell({
-          name: runtime.branch,
-          fromMainOid: input.fromMainOid as import("../core/model.js").Oid,
-          cardPath: input.cardPath,
-          cardBytes: input.cardBytes,
-        });
-        const anchor = await github.createIntegrationBranch(
-          { name: runtime.branch, fromMainOid: input.fromMainOid },
-          _context,
-        );
-        return anchor.kind === "permissionDenied" || anchor.kind === "notFound"
-          ? anchor
-          : { kind: "alreadyApplied", value: result };
-      } catch (error) {
-        return {
-          kind: "retryableTransport",
-          detail: gitFailureDetail(error),
-        };
-      }
-    },
   };
 }
 

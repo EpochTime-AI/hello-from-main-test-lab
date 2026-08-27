@@ -37,6 +37,7 @@ const allowed = new Set([
   "rebase",
   "status",
   "ls-files",
+  "ls-remote",
   "rev-parse",
   "show",
   "ls-tree",
@@ -54,6 +55,55 @@ const allowed = new Set([
   "rev-list",
 ]);
 const legacyCandidateManifestPath = ".hello-from-main/candidate.json";
+const integrationBranchPattern =
+  /^feature\/card-[A-Za-z0-9-]+-source-[1-9][0-9]*$/u;
+
+function isCanonicalIntegrationBranch(value: string): boolean {
+  return integrationBranchPattern.test(value);
+}
+const setupProjectShellProofs = new WeakSet<object>();
+
+export type SetupProjectShellProof = {
+  readonly operationNonce: string;
+  readonly branchName: string;
+  readonly branchHeadOid: Oid;
+};
+
+export function isSetupProjectShellProof(
+  value: unknown,
+): value is SetupProjectShellProof {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    setupProjectShellProofs.has(value)
+  );
+}
+
+function setupProjectShellProof(
+  operationNonce: string,
+  branchName: string,
+  branchHeadOid: Oid,
+): SetupProjectShellProof {
+  const proof = Object.freeze({ operationNonce, branchName, branchHeadOid });
+  setupProjectShellProofs.add(proof);
+  return proof;
+}
+
+export function parseExactRemoteRef(
+  output: string,
+  requestedRef: string,
+): Oid | undefined {
+  if (!output.endsWith("\n") || output.slice(0, -1).includes("\n"))
+    return undefined;
+  const fields = output.slice(0, -1).split("\t");
+  if (
+    fields.length !== 2 ||
+    !/^[0-9a-f]{40}$/u.test(fields[0] ?? "") ||
+    fields[1] !== requestedRef
+  )
+    return undefined;
+  return oid(fields[0] as string);
+}
 
 export type GitResult = {
   commandId: string;
@@ -360,7 +410,10 @@ export class RealGitWorkspace {
     fromMainOid: Oid;
     cardPath: string;
     cardBytes: Uint8Array;
+    setupOperationNonce?: string;
   }) {
+    if (!isCanonicalIntegrationBranch(input.name) || input.name !== this.branch)
+      throw new Error("invalid Integration Branch name");
     const main = oid(
       await git(this.runner, this.cwd, "rev-parse", "origin/main"),
     );
@@ -396,7 +449,12 @@ export class RealGitWorkspace {
       this.cwd,
       "commit",
       "--message",
-      "Create Project Shell",
+      input.setupOperationNonce
+        ? `Create Project Shell\n\nHello-From-Main-Setup-Nonce: ${input.setupOperationNonce}`
+        : "Create Project Shell",
+    );
+    const proposedOid = oid(
+      await git(this.runner, this.cwd, "rev-parse", "HEAD"),
     );
     await git(
       this.runner,
@@ -405,14 +463,44 @@ export class RealGitWorkspace {
       "--force-with-lease",
       this.remote,
       `HEAD:${input.name}`,
-    );
+    ).catch(async (error) => {
+      const remote = await this.remoteBranchOid(input.name);
+      if (remote === proposedOid) return;
+      throw error;
+    });
+    const remoteOid = await this.remoteBranchOid(input.name);
+    if (remoteOid !== proposedOid)
+      throw new Error("Project Shell remote ref did not match proposed commit");
     return {
       branch: {
         name: input.name,
-        headOid: oid(await git(this.runner, this.cwd, "rev-parse", "HEAD")),
+        headOid: proposedOid,
         provenance: "observed" as const,
       },
+      establishedByCurrentOperation: true as const,
+      ...(input.setupOperationNonce
+        ? {
+            setupProjectShellProof: setupProjectShellProof(
+              input.setupOperationNonce,
+              input.name,
+              proposedOid,
+            ),
+          }
+        : {}),
+      ...(input.setupOperationNonce
+        ? { setupOperationNonce: input.setupOperationNonce }
+        : {}),
     };
+  }
+
+  private async remoteBranchOid(name: string): Promise<Oid | undefined> {
+    if (!isCanonicalIntegrationBranch(name)) return undefined;
+    const ref = `refs/heads/${name}`;
+    const output = await this.runner
+      .run(["ls-remote", this.remote, ref], { cwd: this.cwd })
+      .then((result) => (result.status === 0 ? result.stdout : undefined))
+      .catch(() => undefined);
+    return output === undefined ? undefined : parseExactRemoteRef(output, ref);
   }
   async readWorkspace(context?: {
     signal: AbortSignal;

@@ -5,6 +5,7 @@ import {
   GitCommandError,
   type GitRunner,
   installGitAuthentication,
+  parseExactRemoteRef,
   RealGitWorkspace,
 } from "../../src/adapters/git.js";
 import {
@@ -20,7 +21,48 @@ import {
   resolvedAliceCardBytes,
 } from "../../src/scenarios/good-first-conflict.js";
 
+function projectShellBytes(): Uint8Array {
+  return new TextEncoder().encode(
+    "---\ngithub: alice\ngithub_id: 7\navatar: https://avatars.githubusercontent.com/u/7?v=4\nsource_pr: 1\n---\n\n# Project shell\n\n最近在折腾：Git metadata\n\n> Project source metadata\n",
+  );
+}
+
 describe("real local Git scenario", () => {
+  test.each([
+    [
+      "exact",
+      `${"a".repeat(40)}\trefs/heads/feature/card-alice-source-1\n`,
+      true,
+    ],
+    ["wrong ref", `${"a".repeat(40)}\trefs/heads/other\n`, false],
+    [
+      "multiple",
+      "a".repeat(40) +
+        "\trefs/heads/feature/card-alice-source-1\n" +
+        "b".repeat(40) +
+        "\trefs/heads/feature/card-alice-source-1",
+      false,
+    ],
+    [
+      "malformed oid",
+      `${"A".repeat(40)}\trefs/heads/feature/card-alice-source-1\n`,
+      false,
+    ],
+    [
+      "extra field",
+      `${"a".repeat(40)}\trefs/heads/feature/card-alice-source-1\textra\n`,
+      false,
+    ],
+  ] as const)(
+    "strictly parses %s ls-remote output",
+    (_name, output, accepted) => {
+      const actual = parseExactRemoteRef(
+        output,
+        "refs/heads/feature/card-alice-source-1",
+      );
+      expect(Boolean(actual)).toBe(accepted);
+    },
+  );
   test("keeps Git argv isolated and rejects shell-shaped input", async () => {
     const runner = createGitRunner({ root: "/tmp/hello-from-main-test" });
 
@@ -62,6 +104,196 @@ describe("real local Git scenario", () => {
         `100644 ${gitBlobOid(new TextEncoder().encode(`${conflict.stages[2]}\n`))} 2\tpeople/alice.md\n100644 ${gitBlobOid(resolvedAliceCardBytes)} 3\tpeople/alice.md\n`,
       );
       expect(conflict.rebaseHead).not.toBe("");
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("marks a Project Shell only after its exact proposed commit is read back from the bare remote", async () => {
+    const scenario = await createGoodFirstConflictScenario();
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const main = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const result =
+        await scenario.botWorkspace.createIntegrationBranchWithProjectShell({
+          name: "feature/card-alice-source-1",
+          fromMainOid: main,
+          cardPath: "people/alice.md",
+          cardBytes: new TextEncoder().encode(
+            "---\ngithub: alice\ngithub_id: 7\navatar: https://avatars.githubusercontent.com/u/7?v=4\nsource_pr: 1\n---\n\n# Project shell\n\n最近在折腾：Git metadata\n\n> Project source metadata\n",
+          ),
+          setupOperationNonce: "test-nonce",
+        });
+      const remote = oid(
+        (
+          await runner.run(
+            ["rev-parse", "origin/feature/card-alice-source-1"],
+            { cwd: scenario.integrationPath },
+          )
+        ).stdout.trim(),
+      );
+      expect(
+        "establishedByCurrentOperation" in result &&
+          result.establishedByCurrentOperation,
+      ).toBe(true);
+      expect(result.branch.headOid).toBe(remote);
+      const proof =
+        "setupProjectShellProof" in result
+          ? result.setupProjectShellProof
+          : undefined;
+      expect(proof).toBeDefined();
+      expect(Object.isFrozen(proof)).toBe(true);
+      expect(proof?.operationNonce).toBe("test-nonce");
+      expect(proof?.branchName).toBe("feature/card-alice-source-1");
+      expect(proof?.branchHeadOid).toBe(remote);
+      expect(() => {
+        if (proof)
+          (proof as { branchHeadOid: string }).branchHeadOid = oid("forged");
+      }).toThrow();
+      expect(
+        (
+          await runner.run(["show", "-s", "--format=%B", remote], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout,
+      ).toContain("Hello-From-Main-Setup-Nonce: test-nonce");
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("does not mark a preexisting exact Project Shell as this operation", async () => {
+    const scenario = await createGoodFirstConflictScenario({
+      prebuiltIntegration: true,
+    });
+    try {
+      const runner = createGitRunner({ root: scenario.root });
+      const main = oid(
+        (
+          await runner.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const result =
+        await scenario.botWorkspace.createIntegrationBranchWithProjectShell({
+          name: "feature/card-alice-source-1",
+          fromMainOid: main,
+          cardPath: "people/alice.md",
+          cardBytes: new TextEncoder().encode(
+            "---\ngithub: alice\ngithub_id: 7\navatar: https://avatars.githubusercontent.com/u/7?v=4\nsource_pr: 1\n---\n\n# Project shell\n\n最近在折腾：Git metadata\n\n> Project source metadata\n",
+          ),
+          setupOperationNonce: "new-nonce",
+        });
+      expect("establishedByCurrentOperation" in result).toBe(false);
+      expect("setupOperationNonce" in result).toBe(false);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("recovers a response-lost Project Shell push only after exact remote readback", async () => {
+    const scenario = await createGoodFirstConflictScenario();
+    try {
+      const base = createGitRunner({ root: scenario.root });
+      let loseResponse = true;
+      const workspace = new RealGitWorkspace(
+        {
+          run: async (argv, options) => {
+            const result = await base.run(argv, options);
+            if (loseResponse && argv[0] === "push") {
+              loseResponse = false;
+              throw new GitCommandError({
+                ...result,
+                status: 1,
+                stderr: "lost",
+              });
+            }
+            return result;
+          },
+        },
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      );
+      const main = oid(
+        (
+          await base.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      const result = await workspace.createIntegrationBranchWithProjectShell({
+        name: "feature/card-alice-source-1",
+        fromMainOid: main,
+        cardPath: "people/alice.md",
+        cardBytes: projectShellBytes(),
+        setupOperationNonce: "response-lost-nonce",
+      });
+      expect(
+        "establishedByCurrentOperation" in result &&
+          result.establishedByCurrentOperation,
+      ).toBe(true);
+    } finally {
+      await scenario.dispose();
+    }
+  });
+
+  test("does not mark a concurrent bare-remote winner", async () => {
+    const scenario = await createGoodFirstConflictScenario();
+    try {
+      const base = createGitRunner({ root: scenario.root });
+      let replaceRemote = true;
+      const workspace = new RealGitWorkspace(
+        {
+          run: async (argv, options) => {
+            const result = await base.run(argv, options);
+            if (replaceRemote && argv[0] === "push") {
+              replaceRemote = false;
+              const main = (
+                await base.run(["rev-parse", "refs/heads/main"], {
+                  cwd: scenario.upstream,
+                })
+              ).stdout.trim();
+              await base.run(
+                ["update-ref", "refs/heads/feature/card-alice-source-1", main],
+                { cwd: scenario.upstream },
+              );
+              throw new GitCommandError({
+                ...result,
+                status: 1,
+                stderr: "lost",
+              });
+            }
+            return result;
+          },
+        },
+        scenario.integrationPath,
+        "origin",
+        "feature/card-alice-source-1",
+      );
+      const main = oid(
+        (
+          await base.run(["rev-parse", "origin/main"], {
+            cwd: scenario.integrationPath,
+          })
+        ).stdout.trim(),
+      );
+      await expect(
+        workspace.createIntegrationBranchWithProjectShell({
+          name: "feature/card-alice-source-1",
+          fromMainOid: main,
+          cardPath: "people/alice.md",
+          cardBytes: projectShellBytes(),
+          setupOperationNonce: "concurrent-nonce",
+        }),
+      ).rejects.toThrow("lost");
     } finally {
       await scenario.dispose();
     }

@@ -712,6 +712,8 @@ export function createLocalGithubPlatform(
         kind: "integration",
         headOid: branch.headOid,
         baseOid: main.oid,
+        headRef: branch.name,
+        baseRef: "main",
         draft: true,
       });
       state = {
@@ -743,6 +745,7 @@ export function createLocalGithubPlatform(
       const updated = modeledPullRequest({
         ...source,
         baseOid: branch.headOid,
+        baseRef: branch.name,
       });
       state = { ...state, sourcePullRequest: modeledObservation(updated) };
       persist();

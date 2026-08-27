@@ -546,6 +546,7 @@ export type ReconcileOutcome =
 export type SetupMutationResult = OperationResult<{
   branch?: BranchAnchor;
   pullRequest?: PullRequestFact;
+  setupEstablishedByCurrentOperation?: true;
 }>;
 
 export type ReadyReadback =

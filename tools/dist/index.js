@@ -104,7 +104,9 @@ __export(git_exports, {
   createGitRunner: () => createGitRunner,
   createGitSandbox: () => createGitSandbox,
   git: () => git,
-  installGitAuthentication: () => installGitAuthentication
+  installGitAuthentication: () => installGitAuthentication,
+  isSetupProjectShellProof: () => isSetupProjectShellProof,
+  parseExactRemoteRef: () => parseExactRemoteRef
 });
 import { spawn } from "node:child_process";
 import { createHash as createHash2, randomUUID } from "node:crypto";
@@ -118,6 +120,25 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+function isCanonicalIntegrationBranch(value) {
+  return integrationBranchPattern.test(value);
+}
+function isSetupProjectShellProof(value) {
+  return typeof value === "object" && value !== null && setupProjectShellProofs.has(value);
+}
+function setupProjectShellProof(operationNonce, branchName, branchHeadOid) {
+  const proof = Object.freeze({ operationNonce, branchName, branchHeadOid });
+  setupProjectShellProofs.add(proof);
+  return proof;
+}
+function parseExactRemoteRef(output, requestedRef) {
+  if (!output.endsWith("\n") || output.slice(0, -1).includes("\n"))
+    return void 0;
+  const fields = output.slice(0, -1).split("	");
+  if (fields.length !== 2 || !/^[0-9a-f]{40}$/u.test(fields[0] ?? "") || fields[1] !== requestedRef)
+    return void 0;
+  return oid(fields[0]);
+}
 function createGitAuthenticationEnv(input) {
   if (!input.token) throw new Error("Git authentication token is required");
   return {
@@ -505,7 +526,7 @@ async function createGitSandbox() {
     dispose: () => rm(root, { recursive: true, force: true })
   };
 }
-var allowed, legacyCandidateManifestPath, GitCommandError, nextCommand, ContributorGitDriver, RealGitWorkspace;
+var allowed, legacyCandidateManifestPath, integrationBranchPattern, setupProjectShellProofs, GitCommandError, nextCommand, ContributorGitDriver, RealGitWorkspace;
 var init_git = __esm({
   "src/adapters/git.ts"() {
     "use strict";
@@ -524,6 +545,7 @@ var init_git = __esm({
       "rebase",
       "status",
       "ls-files",
+      "ls-remote",
       "rev-parse",
       "show",
       "ls-tree",
@@ -541,6 +563,8 @@ var init_git = __esm({
       "rev-list"
     ]);
     legacyCandidateManifestPath = ".hello-from-main/candidate.json";
+    integrationBranchPattern = /^feature\/card-[A-Za-z0-9-]+-source-[1-9][0-9]*$/u;
+    setupProjectShellProofs = /* @__PURE__ */ new WeakSet();
     GitCommandError = class extends Error {
       constructor(result) {
         super(
@@ -644,6 +668,8 @@ var init_git = __esm({
       activeSignal;
       runner;
       async createIntegrationBranchWithProjectShell(input) {
+        if (!isCanonicalIntegrationBranch(input.name) || input.name !== this.branch)
+          throw new Error("invalid Integration Branch name");
         const main = oid(
           await git(this.runner, this.cwd, "rev-parse", "origin/main")
         );
@@ -679,7 +705,12 @@ var init_git = __esm({
           this.cwd,
           "commit",
           "--message",
-          "Create Project Shell"
+          input.setupOperationNonce ? `Create Project Shell
+
+Hello-From-Main-Setup-Nonce: ${input.setupOperationNonce}` : "Create Project Shell"
+        );
+        const proposedOid = oid(
+          await git(this.runner, this.cwd, "rev-parse", "HEAD")
         );
         await git(
           this.runner,
@@ -688,14 +719,36 @@ var init_git = __esm({
           "--force-with-lease",
           this.remote,
           `HEAD:${input.name}`
-        );
+        ).catch(async (error) => {
+          const remote = await this.remoteBranchOid(input.name);
+          if (remote === proposedOid) return;
+          throw error;
+        });
+        const remoteOid = await this.remoteBranchOid(input.name);
+        if (remoteOid !== proposedOid)
+          throw new Error("Project Shell remote ref did not match proposed commit");
         return {
           branch: {
             name: input.name,
-            headOid: oid(await git(this.runner, this.cwd, "rev-parse", "HEAD")),
+            headOid: proposedOid,
             provenance: "observed"
-          }
+          },
+          establishedByCurrentOperation: true,
+          ...input.setupOperationNonce ? {
+            setupProjectShellProof: setupProjectShellProof(
+              input.setupOperationNonce,
+              input.name,
+              proposedOid
+            )
+          } : {},
+          ...input.setupOperationNonce ? { setupOperationNonce: input.setupOperationNonce } : {}
         };
+      }
+      async remoteBranchOid(name) {
+        if (!isCanonicalIntegrationBranch(name)) return void 0;
+        const ref = `refs/heads/${name}`;
+        const output = await this.runner.run(["ls-remote", this.remote, ref], { cwd: this.cwd }).then((result) => result.status === 0 ? result.stdout : void 0).catch(() => void 0);
+        return output === void 0 ? void 0 : parseExactRemoteRef(output, ref);
       }
       async readWorkspace(context) {
         this.activeSignal = context?.signal;
@@ -1273,6 +1326,8 @@ init_git();
 
 // src/adapters/octokit.ts
 init_model();
+init_git();
+var setupGrants = /* @__PURE__ */ new WeakMap();
 var OctokitOperationError = class extends Error {
   constructor(category, message) {
     super(message);
@@ -1289,6 +1344,7 @@ function createOctokitGithubPlatform(options) {
   const commentReadback = options.commentReadback ?? {};
   const commentLifecycle = /* @__PURE__ */ new Set();
   const commentCreatePermits = [];
+  const consumedSetupProofs = /* @__PURE__ */ new WeakSet();
   const path = (suffix) => `/repos/${options.owner}/${options.repo}${suffix}`;
   const apiCommentPath = (suffix) => path(suffix);
   const mergeIntegration = async (request) => {
@@ -1493,17 +1549,10 @@ function createOctokitGithubPlatform(options) {
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return grantSetupCommentCreatePermit({
+        return {
           kind: "succeeded",
           value: { branch: branchFromResponse(response.data, input.name) }
-        });
-      if (response.status === 422) {
-        try {
-          const branch = await readBranch(input.name);
-          return { kind: "alreadyApplied", value: { branch } };
-        } catch {
-        }
-      }
+        };
       return operationFailure(response);
     },
     async createIntegrationPullRequest(input, context) {
@@ -1542,20 +1591,20 @@ function createOctokitGithubPlatform(options) {
               (item) => stringValue(asRecord2(item.head).ref) === input.branchName
             ) : void 0;
             if (found)
-              return grantSetupCommentCreatePermit({
+              return {
                 kind: "alreadyApplied",
                 value: { pullRequest: pullRequestFact(found, "integration") }
-              });
+              };
           } catch {
           }
         }
         return operationFailure(error);
       }
       if (response.status === 201 || response.status === 200)
-        return grantSetupCommentCreatePermit({
+        return {
           kind: "succeeded",
           value: { pullRequest: pullRequestFact(response.data, "integration") }
-        });
+        };
       return operationFailure(response);
     },
     async updatePullRequestBase(input, context) {
@@ -1571,16 +1620,28 @@ function createOctokitGithubPlatform(options) {
           "mutation"
         );
       } catch (error) {
+        if (error instanceof OctokitOperationError && error.category === "unknownOutcome") {
+          try {
+            const response2 = await requestRest(
+              {
+                method: "GET",
+                path: path(`/pulls/${input.pullRequestNumber}`)
+              },
+              "read"
+            );
+            const updated = pullRequestFact(response2.data, "contribution");
+            if (updated.number === input.pullRequestNumber && updated.baseRef === input.integrationBranchName)
+              return { kind: "alreadyApplied", value: updated };
+          } catch {
+          }
+        }
         return operationFailure(error);
       }
       if (response.status === 200) {
         const updated = pullRequestFact(response.data, "contribution");
         if (updated.baseRef !== input.integrationBranchName)
           return { kind: "stalePrecondition" };
-        return grantSetupCommentCreatePermit({
-          kind: "succeeded",
-          value: updated
-        });
+        return { kind: "succeeded", value: updated };
       }
       return operationFailure(response);
     },
@@ -1772,6 +1833,20 @@ function createOctokitGithubPlatform(options) {
       }
     }
   };
+  setupGrants.set(platform, (input) => {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    const canonicalBranch = source ? `feature/card-${source.authorLogin ?? "source"}-source-${source.number}` : void 0;
+    if (!source?.authorGithubId || input.sourcePullRequestNumber !== source.number || input.sourceLogin !== source.authorLogin || input.branchName !== canonicalBranch || !isSetupProjectShellProof(input.proof) || input.proof.operationNonce !== input.operationNonce || consumedSetupProofs.has(input.proof) || input.proof.branchName !== canonicalBranch || !input.proof.branchHeadOid)
+      return false;
+    consumedSetupProofs.add(input.proof);
+    grantCommentCreatePermit({
+      targetPullRequestNumber: source.number,
+      slot: "source-status",
+      phase: "setup",
+      milestone: "setup"
+    });
+    return true;
+  });
   return platform;
   async function mergeRequest(number, expectedHeadOid) {
     let response;
@@ -2436,17 +2511,6 @@ function createOctokitGithubPlatform(options) {
       );
     }
   }
-  function grantSetupCommentCreatePermit(result) {
-    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
-    if (source)
-      grantCommentCreatePermit({
-        targetPullRequestNumber: source.number,
-        slot: "source-status",
-        phase: "setup",
-        milestone: "setup"
-      });
-    return result;
-  }
   function grantCommentCreatePermit(input) {
     const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
     if (!source?.authorGithubId) return;
@@ -2530,6 +2594,49 @@ function createOctokitGithubPlatform(options) {
       );
     }
   }
+}
+function bindProductionSetupAuthority(github, workspace, runtime) {
+  const grant = setupGrants.get(github);
+  if (!grant) return github;
+  const operationNonce = crypto.randomUUID();
+  return {
+    ...github,
+    async createIntegrationBranch(input, _context) {
+      if (!input.cardPath || !input.cardBytes)
+        return {
+          kind: "retryableTransport",
+          detail: "Project Shell bytes are required"
+        };
+      try {
+        const result = await workspace.createIntegrationBranchWithProjectShell({
+          name: runtime.branch,
+          fromMainOid: oid(input.fromMainOid),
+          cardPath: input.cardPath,
+          cardBytes: input.cardBytes,
+          setupOperationNonce: operationNonce
+        });
+        const setupEstablished = "establishedByCurrentOperation" in result && result.establishedByCurrentOperation && "setupOperationNonce" in result && result.setupOperationNonce === operationNonce && "setupProjectShellProof" in result && isSetupProjectShellProof(result.setupProjectShellProof) && result.setupProjectShellProof.operationNonce === operationNonce && grant({
+          operationNonce,
+          sourcePullRequestNumber: runtime.sourcePullRequestNumber,
+          sourceLogin: runtime.sourceLogin,
+          branchName: runtime.branch,
+          proof: result.setupProjectShellProof
+        });
+        return {
+          kind: setupEstablished ? "succeeded" : "alreadyApplied",
+          value: {
+            branch: result.branch,
+            ...setupEstablished ? { setupEstablishedByCurrentOperation: true } : {}
+          }
+        };
+      } catch (error) {
+        return {
+          kind: "retryableTransport",
+          detail: `Project Shell setup failed: ${error instanceof Error ? error.message : "unknown"}`
+        };
+      }
+    }
+  };
 }
 function milestoneForCommentPhase(phase) {
   if (phase === "setup") return "setup";
@@ -3396,6 +3503,7 @@ function createReconciler(dependencies) {
     async reconcile({ budget, onDiagnostic }) {
       let effects = 0;
       let turn = 0;
+      let setupCommentLifecycle = "none";
       while (effects < budget.maxEffects) {
         turn += 1;
         let observed;
@@ -3427,6 +3535,10 @@ function createReconciler(dependencies) {
         }
         if (observed.status !== "ready" || !observed.value) {
           const outcome2 = observationOutcome(observed.status);
+          if (setupCommentLifecycle === "awaiting-comment" && (observed.status === "incomplete" || observed.status === "notVisibleYet")) {
+            effects += 1;
+            continue;
+          }
           onDiagnostic?.({ turn, outcome: outcome2 });
           return outcome2;
         }
@@ -3461,6 +3573,8 @@ function createReconciler(dependencies) {
             outcome2 = { kind: "retryable", reason: "unknownOutcome" };
           }
           if (!outcome2) continue;
+          if (outcome2.kind === "setupEstablished")
+            return { kind: "terminal", reason: "policyRejected" };
           onDiagnostic?.({ turn, effect: terminal.kind, outcome: outcome2 });
           return outcome2;
         }
@@ -3468,9 +3582,14 @@ function createReconciler(dependencies) {
           facts,
           workspace.value,
           dependencies.candidatePolicy,
-          commentsSupported
+          commentsSupported,
+          setupCommentLifecycle === "comment-satisfied"
         );
         if (derived?.kind === "awaitingExternalFact" || derived?.kind === "retryable" || derived?.kind === "terminal" || derived?.kind === "budgetExhausted") {
+          if (derived.kind === "awaitingExternalFact" && setupCommentLifecycle === "awaiting-comment") {
+            effects += 1;
+            continue;
+          }
           onDiagnostic?.({ turn, outcome: derived });
           return derived;
         }
@@ -3495,7 +3614,16 @@ function createReconciler(dependencies) {
         } catch {
           outcome = { kind: "retryable", reason: "unknownOutcome" };
         }
-        if (!outcome) continue;
+        if (!outcome) {
+          if (effect.kind === "ensureComment" && effect.intent.phase === "setup")
+            setupCommentLifecycle = "comment-satisfied";
+          continue;
+        }
+        if (outcome.kind === "setupEstablished") {
+          if (effect.kind === "createBranch")
+            setupCommentLifecycle = "awaiting-comment";
+          continue;
+        }
         onDiagnostic?.({ turn, effect: effect.kind, outcome });
         if (outcome.kind === "terminal" || outcome.kind === "awaitingExternalFact" || outcome.kind === "retryable" || outcome.kind === "quiescent")
           return outcome;
@@ -3506,7 +3634,7 @@ function createReconciler(dependencies) {
     }
   };
 }
-function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
+function deriveEffect(facts, workspace, candidatePolicy, commentsSupported, setupCommentSatisfied) {
   const source = facts.sourcePullRequest.value;
   const branch = facts.integrationBranch.value;
   const integration = facts.integrationPullRequest.value;
@@ -3543,14 +3671,29 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
   if (!integration && facts.integrationPullRequest.status === "absent")
     return { kind: "createIntegrationPr", branchName };
   if (!branchHeadOid || !integration) return void 0;
-  if (!source.merged && source.baseOid !== branchHeadOid) {
+  if (!source.merged && (integration.headOid !== branchHeadOid || integration.baseOid !== main.oid || !integration.draft))
+    return { kind: "terminal", reason: "policyRejected" };
+  if (!source.merged && (source.baseOid !== branchHeadOid || source.baseRef !== branchName)) {
     return { kind: "retarget", pullRequestNumber: source.number, branchName };
   }
-  if (facts.sourceHeadBasedOnIntegration?.status !== "ready" || !facts.sourceHeadBasedOnIntegration.value)
-    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (commentsSupported && (!source.authorGithubId || !facts.trustedCommentOwner))
     return { kind: "terminal", reason: "permissionDenied" };
-  const setupComment = commentsSupported ? commentEffect(
+  if (!validBeforeRebase(validation)) {
+    const feedback = commentsSupported ? commentEffect(
+      facts,
+      source.number,
+      "source-status",
+      "validation-feedback",
+      renderValidationComment({
+        runIdentity: runIdentity(source),
+        sourcePullRequestNumber: source.number,
+        sourceHeadOid: source.headOid,
+        result: validation
+      })
+    ) : void 0;
+    return feedback ?? { kind: "terminal", reason: "policyRejected" };
+  }
+  const setupComment = commentsSupported && !setupCommentSatisfied ? commentEffect(
     facts,
     source.number,
     "source-status",
@@ -3564,6 +3707,8 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
     })
   ) : void 0;
   if (setupComment) return setupComment;
+  if (facts.sourceHeadBasedOnIntegration?.status !== "ready" || !facts.sourceHeadBasedOnIntegration.value)
+    return sourceAncestryOutcome(facts.sourceHeadBasedOnIntegration?.status);
   if (validation.kind === "invalid") {
     const feedback = commentsSupported ? commentEffect(
       facts,
@@ -3753,6 +3898,11 @@ function deriveEffect(facts, workspace, candidatePolicy, commentsSupported) {
   }
   return void 0;
 }
+function validBeforeRebase(validation) {
+  return validation.kind === "valid" || validation.issues.every(
+    (issue) => issue.category === "integration-base-or-ancestry"
+  );
+}
 function providerEligible(facts, pullRequestNumber, headOid) {
   const { checks, reviews, mergeability, baseCurrent } = facts.eligibility;
   return checks.status === "ready" && checks.value !== void 0 && checks.value.length > 0 && checks.value.every(
@@ -3881,16 +4031,18 @@ async function executeEffect(effect, dependencies, budget) {
       return { kind: "retryable", reason: "stalePrecondition" };
     return void 0;
   }
-  if (effect.kind === "createBranch")
-    return operationOutcome(
-      await withinBudget(
-        budget,
-        (context) => dependencies.github.createIntegrationBranch(effect, {
-          ...context,
-          ...dependencies.invocationContext
-        })
-      )
+  if (effect.kind === "createBranch") {
+    const result = await withinBudget(
+      budget,
+      (context) => dependencies.github.createIntegrationBranch(effect, {
+        ...context,
+        ...dependencies.invocationContext
+      })
     );
+    if (result.kind !== "succeeded" && result.kind !== "alreadyApplied")
+      return operationCategoryOutcome(result.kind);
+    return result.value.setupEstablishedByCurrentOperation ? { kind: "setupEstablished" } : void 0;
+  }
   if (effect.kind === "createIntegrationPr")
     return operationOutcome(
       await withinBudget(
@@ -4402,7 +4554,7 @@ async function runProductionComposition(input) {
       candidatePolicy: productionCandidatePolicy,
       invocationContext: sourceContext
     });
-    const outcome = await composition.run({ maxEffects: 8 }, (diagnostic) => {
+    const outcome = await composition.run({ maxEffects: 12 }, (diagnostic) => {
       process.stdout.write(
         `${JSON.stringify({
           kind: "hello-from-main-diagnostic",
@@ -4516,6 +4668,11 @@ function trustedApiMatchesServer(apiOrigin, serverOrigin) {
   return apiOrigin === "https://api.github.com" && serverOrigin === "https://github.com" || new URL(apiOrigin).origin === serverOrigin && (new URL(apiOrigin).pathname === "/api/v3" || new URL(apiOrigin).pathname === "");
 }
 function bindProductionSetup(github, runtime, workspace) {
+  const setupGithub = bindProductionSetupAuthority(
+    github,
+    workspace,
+    runtime
+  );
   async function mergePullRequest(request, context) {
     if (request.kind === "integration") {
       const result = await workspace.publishIntegrationMerge(request, context);
@@ -4526,33 +4683,8 @@ function bindProductionSetup(github, runtime, workspace) {
     return github.mergePullRequest(request, context);
   }
   return {
-    ...github,
-    mergePullRequest,
-    async createIntegrationBranch(input, _context) {
-      if (!input.cardPath || !input.cardBytes)
-        return {
-          kind: "retryableTransport",
-          detail: "Project Shell bytes are required"
-        };
-      try {
-        const result = await workspace.createIntegrationBranchWithProjectShell({
-          name: runtime.branch,
-          fromMainOid: input.fromMainOid,
-          cardPath: input.cardPath,
-          cardBytes: input.cardBytes
-        });
-        const anchor = await github.createIntegrationBranch(
-          { name: runtime.branch, fromMainOid: input.fromMainOid },
-          _context
-        );
-        return anchor.kind === "permissionDenied" || anchor.kind === "notFound" ? anchor : { kind: "alreadyApplied", value: result };
-      } catch (error) {
-        return {
-          kind: "retryableTransport",
-          detail: gitFailureDetail(error)
-        };
-      }
-    }
+    ...setupGithub,
+    mergePullRequest
   };
 }
 function gitFailureDetail(error) {
