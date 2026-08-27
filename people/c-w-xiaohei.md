@@ -5,8 +5,8 @@ avatar: https://avatars.githubusercontent.com/u/88074703?v=4
 source_pr: 3
 ---
 
-# Project shell
+# Carson Rerun
 
-最近在折腾：Git metadata
+最近在折腾：独立验证一条可恢复的 GitHub 协作链路
 
-> Project source metadata
+> 让真实的分支历史和自动化状态都经得起复核
