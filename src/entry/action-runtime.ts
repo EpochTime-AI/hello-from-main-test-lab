@@ -121,12 +121,14 @@ async function runProductionComposition(input: {
       repositoryId = await trustedRepositoryId(transport, owner, repo);
     } catch {
       process.stdout.write(
-        `${JSON.stringify({
-          kind: "hello-from-main-diagnostic",
-          stage: "pre-composition",
-          outcome: "terminal",
-          reason: "capabilityUnavailable",
-        })}\n`,
+        `${JSON.stringify(
+          sanitizeActionOutput({
+            kind: "hello-from-main-diagnostic",
+            stage: "pre-composition",
+            outcome: "terminal",
+            reason: "capabilityUnavailable",
+          }),
+        )}\n`,
       );
       throw new Error("trusted repository identity is unavailable");
     }
@@ -161,20 +163,27 @@ async function runProductionComposition(input: {
     });
     const outcome = await composition.run({ maxEffects: 12 }, (diagnostic) => {
       process.stdout.write(
-        `${JSON.stringify({
-          kind: "hello-from-main-diagnostic",
-          turn: diagnostic.turn,
-          ...(diagnostic.effect ? { effect: diagnostic.effect } : {}),
-          outcome: diagnostic.outcome.kind,
-          ...(diagnostic.outcome.kind === "retryable" ||
-          diagnostic.outcome.kind === "terminal" ||
-          diagnostic.outcome.kind === "awaitingExternalFact"
-            ? { reason: diagnostic.outcome.reason }
-            : {}),
-        })}\n`,
+        `${JSON.stringify(
+          sanitizeActionOutput({
+            kind: "hello-from-main-diagnostic",
+            turn: diagnostic.turn,
+            ...(diagnostic.effect ? { effect: diagnostic.effect } : {}),
+            outcome: diagnostic.outcome.kind,
+            ...(diagnostic.outcome.kind === "retryable" ||
+            diagnostic.outcome.kind === "terminal" ||
+            diagnostic.outcome.kind === "awaitingExternalFact"
+              ? { reason: diagnostic.outcome.reason }
+              : {}),
+            ...(diagnostic.outcome.kind === "terminal" &&
+            diagnostic.outcome.setupDiagnostic &&
+            isSetupPermitDiagnosticCode(diagnostic.outcome.setupDiagnostic)
+              ? { setupDiagnostic: diagnostic.outcome.setupDiagnostic }
+              : {}),
+          }),
+        )}\n`,
       );
     });
-    process.stdout.write(`${JSON.stringify(outcome)}\n`);
+    process.stdout.write(`${JSON.stringify(sanitizeActionOutput(outcome))}\n`);
     if (
       outcome.kind === "retryable" ||
       outcome.kind === "terminal" ||
@@ -184,6 +193,116 @@ async function runProductionComposition(input: {
   } finally {
     await gitAuth.dispose();
   }
+}
+
+function isSetupPermitDiagnosticCode(
+  value: unknown,
+): value is import("../core/model.js").SetupPermitDiagnosticCode {
+  return new Set([
+    "setupAuthorityBridgeMissing",
+    "setupGrantMarkerMissing",
+    "setupGrantNonceMismatch",
+    "setupGrantProofMissing",
+    "setupGrantProofInvalid",
+    "setupGrantProofNonceMismatch",
+    "setupGrantProofReplayed",
+    "setupGrantProofBranchMismatch",
+    "setupGrantProofHeadMissing",
+    "setupGrantSourceIdentityMissing",
+    "setupGrantSourceNumberMismatch",
+    "setupGrantSourceLoginMismatch",
+    "setupGrantBranchMismatch",
+    "setupPermitActionKeyInvalid",
+    "setupPermitAbsent",
+    "setupPermitRunIdentityMismatch",
+    "setupPermitTargetMismatch",
+    "setupPermitSlotMismatch",
+    "setupPermitPhaseMismatch",
+    "setupPermitMilestoneMismatch",
+  ]).has(value as string);
+}
+
+export function serializeActionOutput(value: unknown): string {
+  return `${JSON.stringify(sanitizeActionOutput(value))}\n`;
+}
+
+function sanitizeActionOutput(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object") return { kind: "invalidOutcome" };
+  const record = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  if (record.kind === "hello-from-main-diagnostic") {
+    output.kind = "hello-from-main-diagnostic";
+    if (isDiagnosticStage(record.stage)) output.stage = record.stage;
+    if (Number.isSafeInteger(record.turn) && (record.turn as number) > 0)
+      output.turn = record.turn;
+    if (isDiagnosticEffect(record.effect)) output.effect = record.effect;
+    if (isOutcomeKind(record.outcome)) output.outcome = record.outcome;
+  } else {
+    output.kind = isOutcomeKind(record.kind) ? record.kind : "invalidOutcome";
+    if (
+      record.kind === "budgetExhausted" &&
+      Number.isSafeInteger(record.effects)
+    )
+      output.effects = record.effects;
+  }
+  if (isOutcomeReason(record.reason)) output.reason = record.reason;
+  if (
+    isSetupCapabilityUnavailableOutput(record) &&
+    isSetupPermitDiagnosticCode(record.setupDiagnostic)
+  )
+    output.setupDiagnostic = record.setupDiagnostic;
+  return output;
+}
+
+function isDiagnosticStage(value: unknown): value is "pre-composition" {
+  return value === "pre-composition";
+}
+
+function isDiagnosticEffect(value: unknown): boolean {
+  return new Set([
+    "ensureComment",
+    "createBranch",
+    "createIntegrationPr",
+    "retarget",
+    "mergeContribution",
+    "writeCandidate",
+    "ready",
+    "mergeIntegration",
+  ]).has(value as string);
+}
+
+function isSetupCapabilityUnavailableOutput(
+  record: Record<string, unknown>,
+): boolean {
+  const outcome =
+    record.kind === "hello-from-main-diagnostic" ? record.outcome : record.kind;
+  return outcome === "terminal" && record.reason === "capabilityUnavailable";
+}
+
+function isOutcomeKind(value: unknown): boolean {
+  return new Set([
+    "quiescent",
+    "awaitingExternalFact",
+    "retryable",
+    "budgetExhausted",
+    "terminal",
+  ]).has(value as string);
+}
+
+function isOutcomeReason(value: unknown): boolean {
+  return new Set([
+    "awaitingApproval",
+    "notVisibleYet",
+    "pending",
+    "incomplete",
+    "retryableTransport",
+    "stalePrecondition",
+    "unknownOutcome",
+    "permissionDenied",
+    "notFound",
+    "policyRejected",
+    "capabilityUnavailable",
+  ]).has(value as string);
 }
 
 async function trustedRepositoryId(
@@ -445,7 +564,7 @@ async function runFixtureComposition(): Promise<void> {
     candidatePolicy: productionCandidatePolicy,
   });
   const outcome = await composition.run({ maxEffects: 1 });
-  process.stdout.write(`${JSON.stringify(outcome)}\n`);
+  process.stdout.write(serializeActionOutput(outcome));
   await sandbox.dispose();
 }
 

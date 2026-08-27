@@ -933,7 +933,13 @@ async function executeEffect(
     if (result.kind === "notVisibleYet")
       return { kind: "awaitingExternalFact", reason: "notVisibleYet" };
     if (result.kind === "capabilityUnavailable")
-      return { kind: "terminal", reason: "capabilityUnavailable" };
+      return {
+        kind: "terminal",
+        reason: "capabilityUnavailable",
+        ...(result.setupDiagnostic
+          ? { setupDiagnostic: result.setupDiagnostic }
+          : {}),
+      };
     return {
       kind: "retryable",
       reason:

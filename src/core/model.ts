@@ -166,6 +166,29 @@ export type CommentIntent = {
   observed?: CommentFact;
 };
 
+/** Closed, nonsecret diagnostics for setup authority and permit failures only. */
+export type SetupPermitDiagnosticCode =
+  | "setupAuthorityBridgeMissing"
+  | "setupGrantMarkerMissing"
+  | "setupGrantNonceMismatch"
+  | "setupGrantProofMissing"
+  | "setupGrantProofInvalid"
+  | "setupGrantProofNonceMismatch"
+  | "setupGrantProofReplayed"
+  | "setupGrantProofBranchMismatch"
+  | "setupGrantProofHeadMissing"
+  | "setupGrantSourceIdentityMissing"
+  | "setupGrantSourceNumberMismatch"
+  | "setupGrantSourceLoginMismatch"
+  | "setupGrantBranchMismatch"
+  | "setupPermitActionKeyInvalid"
+  | "setupPermitAbsent"
+  | "setupPermitRunIdentityMismatch"
+  | "setupPermitTargetMismatch"
+  | "setupPermitSlotMismatch"
+  | "setupPermitPhaseMismatch"
+  | "setupPermitMilestoneMismatch";
+
 export type CommentEnsureResult =
   | { kind: "created"; comment: CommentFact }
   | { kind: "updated"; comment: CommentFact }
@@ -176,7 +199,11 @@ export type CommentEnsureResult =
   | { kind: "permissionDenied"; detail?: string }
   | { kind: "notVisibleYet"; detail?: string }
   | { kind: "retryableTransport"; detail?: string }
-  | { kind: "capabilityUnavailable"; detail?: string }
+  | {
+      kind: "capabilityUnavailable";
+      setupDiagnostic?: SetupPermitDiagnosticCode;
+      detail?: string;
+    }
   | { kind: "unknownOutcome"; detail?: string };
 
 export type TrustedRepositoryContext = {
@@ -541,6 +568,7 @@ export type ReconcileOutcome =
         | "notFound"
         | "policyRejected"
         | "capabilityUnavailable";
+      setupDiagnostic?: SetupPermitDiagnosticCode;
     };
 
 export type SetupMutationResult = OperationResult<{

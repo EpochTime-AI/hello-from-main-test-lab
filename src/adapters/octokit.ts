@@ -12,6 +12,7 @@ import type {
   PullRequestFact,
   RepositoryFacts,
   ReviewFact,
+  SetupPermitDiagnosticCode,
   TrustedPrincipal,
 } from "../core/model.js";
 import { oid } from "../core/model.js";
@@ -73,13 +74,36 @@ export type OctokitIntegrationPublicationRecorder = {
   ): void;
 };
 
-type SetupGrant = (input: {
+type SetupGrantReason = Extract<
+  SetupPermitDiagnosticCode,
+  `setupGrant${string}`
+>;
+
+type SetupPermitScope = {
+  actionKey: string;
+  targetPullRequestNumber: number;
+  slot: "source-status";
+  phase: "setup";
+};
+
+type SetupGrant = ((input: {
   operationNonce: string;
   sourcePullRequestNumber: number;
   sourceLogin: string;
   branchName: string;
   proof: import("./git.js").SetupProjectShellProof;
-}) => boolean;
+}) =>
+  | { granted: true }
+  | { granted: false; reason: SetupGrantReason; scope?: SetupPermitScope }) & {
+  scope(): SetupPermitScope | undefined;
+};
+
+type CommentPermitReservation =
+  | { reserved: true; reason: "setupPermitGrantedAndReserved" }
+  | {
+      reserved: false;
+      reason: SetupPermitDiagnosticCode;
+    };
 
 const setupGrants = new WeakMap<object, SetupGrant>();
 
@@ -123,6 +147,62 @@ export class OctokitOperationError extends Error {
   ) {
     super(message);
   }
+}
+
+function grantForCurrentSetupOperation(input: {
+  result: Awaited<
+    ReturnType<RealGitWorkspace["createIntegrationBranchWithProjectShell"]>
+  >;
+  operationNonce: string;
+  runtime: {
+    branch: string;
+    sourcePullRequestNumber: number;
+    sourceLogin: string;
+  };
+  grant: SetupGrant;
+}):
+  | { granted: true }
+  | {
+      granted: false;
+      reason: SetupPermitDiagnosticCode;
+      scope?: SetupPermitScope;
+    } {
+  const result = input.result;
+  if (
+    !("establishedByCurrentOperation" in result) ||
+    !result.establishedByCurrentOperation
+  )
+    return rejectedSetupGrant(input.grant, "setupGrantMarkerMissing");
+  if (
+    !("setupOperationNonce" in result) ||
+    result.setupOperationNonce !== input.operationNonce
+  )
+    return rejectedSetupGrant(input.grant, "setupGrantNonceMismatch");
+  if (!("setupProjectShellProof" in result) || !result.setupProjectShellProof)
+    return rejectedSetupGrant(input.grant, "setupGrantProofMissing");
+  if (!isSetupProjectShellProof(result.setupProjectShellProof))
+    return rejectedSetupGrant(input.grant, "setupGrantProofInvalid");
+  if (result.setupProjectShellProof.operationNonce !== input.operationNonce)
+    return rejectedSetupGrant(input.grant, "setupGrantProofNonceMismatch");
+  return input.grant({
+    operationNonce: input.operationNonce,
+    sourcePullRequestNumber: input.runtime.sourcePullRequestNumber,
+    sourceLogin: input.runtime.sourceLogin,
+    branchName: input.runtime.branch,
+    proof: result.setupProjectShellProof,
+  });
+}
+
+function rejectedSetupGrant(
+  grant: SetupGrant,
+  reason: SetupPermitDiagnosticCode,
+): {
+  granted: false;
+  reason: SetupPermitDiagnosticCode;
+  scope?: SetupPermitScope;
+} {
+  const scope = grant.scope();
+  return { granted: false, reason, ...(scope ? { scope } : {}) };
 }
 
 export function createOctokitGithubPlatform(
@@ -663,10 +743,7 @@ export function createOctokitGithubPlatform(
       activeSignal = context?.signal;
       const expected = options.expectedCommentOwner;
       if (!expected || !validPrincipal(expected))
-        return {
-          kind: "capabilityUnavailable",
-          detail: "expected comment principal is unavailable",
-        };
+        return { kind: "capabilityUnavailable" };
       try {
         const comments = await readIssueComments(
           intent.targetPullRequestNumber,
@@ -694,10 +771,7 @@ export function createOctokitGithubPlatform(
         )
           return { kind: "ambiguousOwnership" };
         if (commentLifecycle.has(commentLifecycleKey(intent))) {
-          return {
-            kind: "capabilityUnavailable",
-            detail: "comment creation is already reserved in this process",
-          };
+          return { kind: "capabilityUnavailable" };
         }
         const current = owned[0];
         if (current) {
@@ -750,11 +824,13 @@ export function createOctokitGithubPlatform(
             : { kind: "stale" };
         }
 
-        if (!reserveCommentCreatePermit(intent))
+        const reservation = reserveCommentCreatePermit(intent);
+        if (!reservation.reserved)
           return {
             kind: "capabilityUnavailable",
-            detail:
-              "missing same-process durable milestone for comment creation",
+            ...(intent.phase === "setup"
+              ? { setupDiagnostic: reservation.reason }
+              : {}),
           };
 
         let response: RestResponse;
@@ -798,7 +874,10 @@ export function createOctokitGithubPlatform(
           );
           commentLifecycle.delete(commentLifecycleKey(intent));
           return sameIntendedComment(post, intent, expected)
-            ? { kind: "created", comment: post }
+            ? {
+                kind: "created",
+                comment: post,
+              }
             : { kind: "stale" };
         } catch (error) {
           if (!isVisibilityUncertainty(error)) throw error;
@@ -809,23 +888,73 @@ export function createOctokitGithubPlatform(
       }
     },
   };
-  setupGrants.set(platform, (input) => {
+  const grant: SetupGrant = (input) => {
     const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
     const canonicalBranch = source
       ? `feature/card-${source.authorLogin ?? "source"}-source-${source.number}`
       : undefined;
-    if (
-      !source?.authorGithubId ||
-      input.sourcePullRequestNumber !== source.number ||
-      input.sourceLogin !== source.authorLogin ||
-      input.branchName !== canonicalBranch ||
-      !isSetupProjectShellProof(input.proof) ||
-      input.proof.operationNonce !== input.operationNonce ||
-      consumedSetupProofs.has(input.proof) ||
-      input.proof.branchName !== canonicalBranch ||
-      !input.proof.branchHeadOid
-    )
-      return false;
+    const scope = source?.authorGithubId
+      ? setupPermitScope(source.number, source.authorGithubId)
+      : undefined;
+    if (!source?.authorGithubId) {
+      return { granted: false, reason: "setupGrantSourceIdentityMissing" };
+    }
+    if (input.sourcePullRequestNumber !== source.number) {
+      return {
+        granted: false,
+        reason: "setupGrantSourceNumberMismatch",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (input.sourceLogin !== source.authorLogin) {
+      return {
+        granted: false,
+        reason: "setupGrantSourceLoginMismatch",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (input.branchName !== canonicalBranch) {
+      return {
+        granted: false,
+        reason: "setupGrantBranchMismatch",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (!isSetupProjectShellProof(input.proof)) {
+      return {
+        granted: false,
+        reason: "setupGrantProofInvalid",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (input.proof.operationNonce !== input.operationNonce) {
+      return {
+        granted: false,
+        reason: "setupGrantProofNonceMismatch",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (consumedSetupProofs.has(input.proof)) {
+      return {
+        granted: false,
+        reason: "setupGrantProofReplayed",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (input.proof.branchName !== canonicalBranch) {
+      return {
+        granted: false,
+        reason: "setupGrantProofBranchMismatch",
+        ...(scope ? { scope } : {}),
+      };
+    }
+    if (!input.proof.branchHeadOid) {
+      return {
+        granted: false,
+        reason: "setupGrantProofHeadMissing",
+        ...(scope ? { scope } : {}),
+      };
+    }
     consumedSetupProofs.add(input.proof);
     grantCommentCreatePermit({
       targetPullRequestNumber: source.number,
@@ -833,8 +962,15 @@ export function createOctokitGithubPlatform(
       phase: "setup",
       milestone: "setup",
     });
-    return true;
-  });
+    return { granted: true };
+  };
+  grant.scope = () => {
+    const source = (lastFacts ?? options.initialFacts)?.sourcePullRequest.value;
+    return source?.authorGithubId
+      ? setupPermitScope(source.number, source.authorGithubId)
+      : undefined;
+  };
+  setupGrants.set(platform, grant);
   return platform as GithubPlatform & OctokitIntegrationPublicationRecorder;
 
   async function mergeRequest(
@@ -1674,22 +1810,62 @@ export function createOctokitGithubPlatform(
     });
   }
 
-  function reserveCommentCreatePermit(intent: CommentIntent): boolean {
+  function reserveCommentCreatePermit(
+    intent: CommentIntent,
+  ): CommentPermitReservation {
     const key = parseCommentActionKey(intent.actionKey);
-    const index = commentCreatePermits.findIndex(
+    if (!key) return { reserved: false, reason: "setupPermitActionKeyInvalid" };
+    if (commentCreatePermits.length === 0)
+      return { reserved: false, reason: "setupPermitAbsent" };
+    const permits = commentCreatePermits;
+    if (!permits.some((permit) => key.runIdentity === permit.runIdentity))
+      return { reserved: false, reason: "setupPermitRunIdentityMismatch" };
+    if (
+      !permits.some(
+        (permit) =>
+          key.runIdentity === permit.runIdentity &&
+          key.targetPullRequestNumber === permit.targetPullRequestNumber &&
+          intent.targetPullRequestNumber === permit.targetPullRequestNumber,
+      )
+    )
+      return { reserved: false, reason: "setupPermitTargetMismatch" };
+    if (
+      !permits.some(
+        (permit) =>
+          key.runIdentity === permit.runIdentity &&
+          key.targetPullRequestNumber === permit.targetPullRequestNumber &&
+          intent.targetPullRequestNumber === permit.targetPullRequestNumber &&
+          key.slot === permit.slot &&
+          intent.slot === permit.slot,
+      )
+    )
+      return { reserved: false, reason: "setupPermitSlotMismatch" };
+    if (
+      !permits.some(
+        (permit) =>
+          key.runIdentity === permit.runIdentity &&
+          key.targetPullRequestNumber === permit.targetPullRequestNumber &&
+          intent.targetPullRequestNumber === permit.targetPullRequestNumber &&
+          key.slot === permit.slot &&
+          intent.slot === permit.slot &&
+          intent.phase === permit.phase,
+      )
+    )
+      return { reserved: false, reason: "setupPermitPhaseMismatch" };
+    const index = permits.findIndex(
       (permit) =>
-        key !== undefined &&
         key.runIdentity === permit.runIdentity &&
         key.targetPullRequestNumber === permit.targetPullRequestNumber &&
-        key.slot === permit.slot &&
         intent.targetPullRequestNumber === permit.targetPullRequestNumber &&
+        key.slot === permit.slot &&
         intent.slot === permit.slot &&
         intent.phase === permit.phase &&
         milestoneForCommentPhase(intent.phase) === permit.milestone,
     );
-    if (index < 0) return false;
+    if (index < 0)
+      return { reserved: false, reason: "setupPermitMilestoneMismatch" };
     commentCreatePermits.splice(index, 1);
-    return true;
+    return { reserved: true, reason: "setupPermitGrantedAndReserved" };
   }
 
   async function findIntegrationBranch(
@@ -1788,16 +1964,42 @@ export function bindProductionSetupAuthority(
   },
 ): GithubPlatform & OctokitIntegrationPublicationRecorder {
   const grant = setupGrants.get(github);
-  if (!grant) return github;
+  if (!grant) {
+    return {
+      ...github,
+      async ensureComment(intent, context) {
+        const result = await github.ensureComment(intent, context);
+        return result.kind === "capabilityUnavailable" &&
+          intent.phase === "setup"
+          ? { ...result, setupDiagnostic: "setupAuthorityBridgeMissing" }
+          : result;
+      },
+    };
+  }
   const operationNonce = crypto.randomUUID();
+  let pendingSetupDiagnostic:
+    | { code: SetupPermitDiagnosticCode; scope: SetupPermitScope }
+    | undefined;
   return {
     ...github,
+    async ensureComment(intent, context) {
+      const result = await github.ensureComment(intent, context);
+      const pending = pendingSetupDiagnostic;
+      pendingSetupDiagnostic = undefined;
+      return result.kind === "capabilityUnavailable" &&
+        pending &&
+        sameSetupPermitScope(intent, pending.scope)
+        ? { ...result, setupDiagnostic: pending.code }
+        : result;
+    },
     async createIntegrationBranch(input, _context) {
-      if (!input.cardPath || !input.cardBytes)
+      if (!input.cardPath || !input.cardBytes) {
+        pendingSetupDiagnostic = undefined;
         return {
           kind: "retryableTransport",
           detail: "Project Shell bytes are required",
         };
+      }
       try {
         const result = await workspace.createIntegrationBranchWithProjectShell({
           name: runtime.branch,
@@ -1806,21 +2008,18 @@ export function bindProductionSetupAuthority(
           cardBytes: input.cardBytes,
           setupOperationNonce: operationNonce,
         });
-        const setupEstablished =
-          "establishedByCurrentOperation" in result &&
-          result.establishedByCurrentOperation &&
-          "setupOperationNonce" in result &&
-          result.setupOperationNonce === operationNonce &&
-          "setupProjectShellProof" in result &&
-          isSetupProjectShellProof(result.setupProjectShellProof) &&
-          result.setupProjectShellProof.operationNonce === operationNonce &&
-          grant({
-            operationNonce,
-            sourcePullRequestNumber: runtime.sourcePullRequestNumber,
-            sourceLogin: runtime.sourceLogin,
-            branchName: runtime.branch,
-            proof: result.setupProjectShellProof,
-          });
+        const grantResult = grantForCurrentSetupOperation({
+          result,
+          operationNonce,
+          runtime,
+          grant,
+        });
+        const setupEstablished = grantResult?.granted === true;
+        pendingSetupDiagnostic = grantResult.granted
+          ? undefined
+          : grantResult.scope
+            ? { code: grantResult.reason, scope: grantResult.scope }
+            : undefined;
         return {
           kind: setupEstablished ? "succeeded" : "alreadyApplied",
           value: {
@@ -1831,6 +2030,7 @@ export function bindProductionSetupAuthority(
           },
         };
       } catch (error) {
+        pendingSetupDiagnostic = undefined;
         return {
           kind: "retryableTransport",
           detail: `Project Shell setup failed: ${error instanceof Error ? error.message : "unknown"}`,
@@ -1838,6 +2038,31 @@ export function bindProductionSetupAuthority(
       }
     },
   };
+}
+
+function setupPermitScope(
+  sourcePullRequestNumber: number,
+  authorGithubId: string,
+): SetupPermitScope {
+  const actionKey = `run=source:${sourcePullRequestNumber}:${authorGithubId};target=${sourcePullRequestNumber};slot=source-status`;
+  return {
+    actionKey,
+    targetPullRequestNumber: sourcePullRequestNumber,
+    slot: "source-status",
+    phase: "setup",
+  };
+}
+
+function sameSetupPermitScope(
+  intent: CommentIntent,
+  scope: SetupPermitScope,
+): boolean {
+  return (
+    intent.actionKey === scope.actionKey &&
+    intent.targetPullRequestNumber === scope.targetPullRequestNumber &&
+    intent.slot === scope.slot &&
+    intent.phase === scope.phase
+  );
 }
 
 function milestoneForCommentPhase(

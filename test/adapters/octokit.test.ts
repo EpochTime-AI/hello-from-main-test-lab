@@ -191,7 +191,11 @@ describe("OctokitGithubPlatform", () => {
       }).reconcile({
         budget: { maxEffects: 6 },
       }),
-    ).resolves.toEqual({ kind: "terminal", reason: "capabilityUnavailable" });
+    ).resolves.toEqual({
+      kind: "terminal",
+      reason: "capabilityUnavailable",
+      setupDiagnostic: "setupPermitAbsent",
+    });
     expect(observed).toBe(5);
     expect(posts).toBe(0);
   });
@@ -282,6 +286,7 @@ describe("OctokitGithubPlatform", () => {
       throw new Error("comment capability is required");
     await expect(platform.ensureComment(intent)).resolves.toMatchObject({
       kind: "capabilityUnavailable",
+      setupDiagnostic: "setupPermitAbsent",
     });
     expect(requests).toEqual([
       expect.objectContaining({
